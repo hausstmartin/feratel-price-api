@@ -1,22 +1,15 @@
-# Feratel Price Proxy API
+# Feratel Price API Proxy
 
-This Node.js Express server acts as a proxy to fetch live pricing and availability from the Feratel booking system for Haus St. Martin.
+Express backend, který spojí všechny pokoje Haus St. Martin s aktuální cenou a dostupností pro zadané datum a počet osob.
 
-## 🚀 How to Deploy (Render.com)
+## Jak použít
 
-1. Create a GitHub repo (e.g., `feratel-price-api`)
-2. Upload these 3 files (`server.js`, `package.json`, `README.md`)
-3. Push to GitHub
-4. Go to [https://dashboard.render.com](https://dashboard.render.com)
-5. Click **New Web Service**
-6. Choose your repo
-7. Use:
-   - Build Command: *(leave empty)*
-   - Start Command: `node server.js`
-   - Port: `3000`
-8. Click **Deploy**
-
-Once deployed, your endpoint will look like:
-`https://<your-name>.onrender.com/get-price`
-
-You can now connect it to your Custom GPT using OpenAPI.
+1. Deployni na Render.com (nebo localhost)
+2. Pošli POST na `/get-price` s JSON:
+   ```json
+   {
+     "arrival": "2026-02-03",
+     "departure": "2026-02-07",
+     "adults": 2,
+     "children": []
+   }
