@@ -65,7 +65,9 @@ app.post('/get-price', async (req, res) => {
   try {
     const response = await axios.post(apiUrl, payload, {
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        // Feratel expects a DW-Source header identifying the app making the request.
+        'DW-Source': 'dwapp-accommodation'
       }
     });
 
