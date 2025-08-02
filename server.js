@@ -67,7 +67,13 @@ app.post('/get-price', async (req, res) => {
       headers: {
         'Content-Type': 'application/json',
         // Feratel expects a DW-Source header identifying the app making the request.
-        'DW-Source': 'dwapp-accommodation'
+        'DW-Source': 'dwapp-accommodation',
+        // Feratel also requires a DW-SessionId header; a timestamp string works as a unique ID.
+        'DW-SessionId': Date.now().toString(),
+        // Optional but recommended headers based on HAR capture
+        'Accept': 'application/json, text/plain, */*',
+        'Origin': 'https://direct.bookingandmore.com',
+        'Referer': 'https://direct.bookingandmore.com'
       }
     });
 
