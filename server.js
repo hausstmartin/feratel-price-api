@@ -53,8 +53,12 @@ app.post('/get-price', async (req, res) => {
 
     res.json({ offers });
   } catch (error) {
-    console.error(error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to fetch data from Feratel' });
+    // vypišeme přesnou odpověď Feratelu do logu i do výstupu
+    console.error('Feratel API ERROR:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Failed to fetch data from Feratel',
+      details: error.response?.data || error.message
+    });
   }
 });
 
