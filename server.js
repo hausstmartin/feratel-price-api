@@ -1,188 +1,99 @@
 const express = require('express');
 const axios = require('axios');
-
 const app = express();
 app.use(express.json());
 
-// Configuration values specific to your Feratel installation.
-// Replace these with your own identifiers if they differ.
-// The accommodation ID. Replace this with the correct ID for your property.
-const accommodationId = '5edbae02-da8e-4489-8349-4bb836450b3e';
-const destination = 'accbludenz';
-const prefix = 'BLU';
+// Základní konfigurace
+const ACCOMMODATION_ID = '5edbae02-da8e-4489-8349-4bb836450b3e';
+const DESTINATION = 'accbludenz';
+const PREFIX = 'BLU';
 
-// The productIds correspond to the “serviceIds” from your widget code.
-const serviceIds = [
-  '495ff768-31df-46d6-86bb-4511f038b2df',
-  '37f364f3-26ed-4a20-b696-72f8ef69c00f',
-  'a375e1af-83bc-4aed-b506-a37d1b31f531',
-  '799a77bc-9fd3-4be5-b715-28f9fd51c864',
-  '2c36e072-ba93-45c0-ae6c-98188964e386',
-  '5bf8f190-b5bd-4941-aa50-71ca6564b045'
-];
-
-/**
- * Convert a date string (YYYY-MM-DD) into a Date object at midnight UTC.
- * @param {string} dateStr
- */
-function toDate(dateStr) {
-  return new Date(dateStr + 'T00:00:00Z');
+// Všechny pokoje načteme z Deskline API
+async function fetchRooms() {
+  const url = `https://webapi.deskline.net/${DESTINATION}/en/accommodations/${PREFIX}/${ACCOMMODATION_ID}/services?fields=id,name,description,rooms,bedrooms,size,order,images(sizes:[55,56,54],types:[13]){imagesFields...,description},fromPrice{value,calcRule,calcDuration},products{id,name,price{min,max,dailyPrice}}&currency=EUR&pageNo=1`;
+  const resp = await axios.get(url);
+  return resp.data;
 }
 
-app.post('/get-price', async (req, res) => {
-  const { arrival, departure, adults = 2, children = [] } = req.body;
-
-  // Validate mandatory parameters
-  if (!arrival || !departure) {
-    return res.status(400).json({ error: 'Missing arrival or departure date' });
-  }
-
-  // Compute number of nights between the dates
-  const arrivalDate = toDate(arrival);
-  const departureDate = toDate(departure);
-  const millisecondsPerDay = 24 * 60 * 60 * 1000;
-  const nights = Math.round((departureDate - arrivalDate) / millisecondsPerDay);
-  if (nights <= 0) {
-    return res.status(400).json({ error: 'Departure date must be after arrival date' });
-  }
-
-  // Build request payload for Feratel API
-  const payload = {
-    productIds: serviceIds,
-    fromDate: `${arrival}T00:00:00.000`,
+// Vrací přesné ceny a dostupnost pro konkrétní pokoje (productIds)
+async function fetchPrices(productIds, fromDate, nights, adults, childrenAges) {
+  const pricePayload = {
+    productIds,
+    fromDate: fromDate + "T00:00:00.000",
     nights,
     units: 1,
     adults,
-    childrenAges: children.join(',') || '',
+    childrenAges: childrenAges.join(','),
     mealCode: '',
     currency: 'EUR',
     nightsRange: 0,
     arrivalRange: 0
   };
+  const headers = {
+    'Content-Type': 'application/json',
+    'DW-Source': 'dwapp-accommodation',
+    'DW-SessionId': Date.now().toString(),
+    'Accept': 'application/json, text/plain, */*',
+    'Origin': 'https://direct.bookingandmore.com',
+    'Referer': 'https://direct.bookingandmore.com'
+  };
+  const url = `https://webapi.deskline.net/${DESTINATION}/en/accommodations/${PREFIX}/${ACCOMMODATION_ID}/pricematrix`;
+  const resp = await axios.post(url, pricePayload, { headers });
+  return resp.data;
+}
 
-    // Prepare common headers for Feratel requests
-    const headers = {
-      'Content-Type': 'application/json',
-      'DW-Source': 'dwapp-accommodation',
-      'DW-SessionId': Date.now().toString(),
-      'Accept': 'application/json, text/plain, */*',
-      'Origin': 'https://direct.bookingandmore.com',
-      'Referer': 'https://direct.bookingandmore.com'
-    };
+// Hlavní endpoint
+app.post('/get-price', async (req, res) => {
+  try {
+    const { arrival, departure, adults = 2, children = [] } = req.body;
+    if (!arrival || !departure) return res.status(400).json({ error: 'Missing arrival/departure' });
+    const nights = Math.round((new Date(departure) - new Date(arrival)) / (1000 * 60 * 60 * 24));
+    if (nights <= 0) return res.status(400).json({ error: 'Departure must be after arrival' });
 
-    try {
-      // Step 1: Create a search to obtain a searchId
-      const searchPayload = {
-        searchObject: {
-          searchGeneral: {
-            dateFrom: `${arrival}T00:00:00.000`,
-            dateTo: `${departure}T00:00:00.000`
-          },
-          searchAccommodation: {
-            searchLines: [
-              {
-                units: 1,
-                adults,
-                children: children.length,
-                childrenAges: children
-              }
-            ]
-          }
-        }
-      };
-      const searchResp = await axios.post('https://webapi.deskline.net/searches', searchPayload, { headers });
-      const searchId = searchResp.data?.id;
-      if (!searchId) {
-        return res.status(500).json({ error: 'Failed to initiate search', details: searchResp.data });
-      }
-      // Step 2: Retrieve service (room) results with price information
-      const fields = 'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
-      const servicesUrl = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}/services/searchresults/${searchId}?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1`;
-      const servicesResp = await axios.get(servicesUrl, { headers });
-      // Determine the array of service items in the response. Different APIs may nest it differently.
-      let items;
-      const data = servicesResp.data;
-      if (Array.isArray(data)) {
-        items = data;
-      } else if (data && typeof data === 'object') {
-        // pick the first array property in the object
-        for (const key of Object.keys(data)) {
-          if (Array.isArray(data[key])) {
-            items = data[key];
-            break;
-          }
-        }
-      }
-      if (!items || !Array.isArray(items)) {
-        return res.json({ offers: [] });
-      }
-      // Extract product IDs from the services to request detailed pricing
-      const productIds = items.map(item => item.id);
-      // Build payload for pricematrix endpoint
-      const pricePayload = {
-        productIds,
-        fromDate: `${arrival}T00:00:00.000`,
-        nights,
-        units: 1,
-        adults,
-        childrenAges: children.join(',') || '',
-        mealCode: '',
-        currency: 'EUR',
-        nightsRange: 0,
-        arrivalRange: 0
-      };
-      // Construct URL for pricematrix for this accommodation
-      const priceUrl = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}/pricematrix`;
-      let priceData = [];
-      try {
-        const priceResp = await axios.post(priceUrl, pricePayload, { headers });
-        priceData = priceResp.data;
-      } catch (priceErr) {
-        console.error('Feratel API ERROR (pricematrix):', priceErr.response?.data || priceErr.message);
-      }
-      // Build a lookup for total price per productId
-      const priceLookup = {};
-      if (Array.isArray(priceData)) {
-        priceData.forEach(item => {
-          const pid = item.productId;
-          let priceList = [];
-          Object.values(item.data || {}).forEach(dayList => {
-            dayList.forEach(entry => {
-              if (typeof entry.price === 'number' && entry.price >= 0) {
-                priceList.push(entry.price);
-              }
-            });
+    // 1. Načti všechny pokoje
+    const services = await fetchRooms();
+    const rooms = (services?.services || services) ?? [];
+    const productIds = rooms.map(room => room.id);
+
+    // 2. Zjisti přesné ceny z pricematrix
+    const priceMatrix = await fetchPrices(productIds, arrival, nights, adults, children);
+
+    // 3. Sestav odpověď (propoj informace a ceny)
+    const result = rooms.map(room => {
+      // Najdi cenu z pricematrix
+      const priceData = Array.isArray(priceMatrix)
+        ? priceMatrix.find(p => p.productId === room.id)
+        : null;
+      // Suma všech cen za každý den pobytu
+      let totalPrice = 0;
+      if (priceData?.data) {
+        Object.values(priceData.data).forEach(dayArr => {
+          dayArr.forEach(day => {
+            if (typeof day.price === 'number') totalPrice += day.price;
           });
-          const total = priceList.reduce((sum, p) => sum + p, 0);
-          priceLookup[pid] = {
-            total,
-            available: priceList.length === nights
-          };
         });
       }
-      const offers = items.map(item => {
-        const pid = item.id;
-        const priceInfo = priceLookup[pid] || { total: 0, available: false };
-        return {
-          productId: pid || '',
-          name: item.name || '',
-          totalPrice: priceInfo.total || 0,
-          currency: 'EUR',
-          availability: priceInfo.available,
-          nights
-        };
-      });
-      res.json({ offers });
-    } catch (error) {
-      console.error('Feratel API ERROR:', error.response?.data || error.message);
-      res.status(500).json({
-        error: 'Failed to fetch data from Feratel',
-        details: error.response?.data || error.message
-      });
-    }
+      // Sestav položku
+      return {
+        id: room.id,
+        name: room.name,
+        description: room.description,
+        images: room.images,
+        size: room.size,
+        maxPersons: room.maxPersons,
+        minPersons: room.minPersons,
+        totalPrice,
+        currency: 'EUR',
+        availability: !!(priceData && totalPrice > 0)
+      };
+    });
+
+    res.json({ offers: result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal error', details: err.message });
+  }
 });
 
-const PORT = 3000;
-app.listen(PORT, () => {
-  console.log(`Feratel proxy API running on port ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('API running on port', PORT));
