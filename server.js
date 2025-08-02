@@ -6,7 +6,8 @@ app.use(express.json());
 
 // Configuration values specific to your Feratel installation.
 // Replace these with your own identifiers if they differ.
-const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
+// The accommodation ID. Replace this with the correct ID for your property.
+const accommodationId = '5edbae02-da8e-4489-8349-4bb836450b3e';
 const destination = 'accbludenz';
 const prefix = 'BLU';
 
@@ -98,15 +99,28 @@ app.post('/get-price', async (req, res) => {
       const fields = 'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
       const servicesUrl = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}/services/searchresults/${searchId}?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1`;
       const servicesResp = await axios.get(servicesUrl, { headers });
-      const items = servicesResp.data?.items || servicesResp.data;
+      // Determine the array of service items in the response. Different APIs may nest it differently.
+      let items;
+      const data = servicesResp.data;
+      if (Array.isArray(data)) {
+        items = data;
+      } else if (data && typeof data === 'object') {
+        // pick the first array property in the object
+        for (const key of Object.keys(data)) {
+          if (Array.isArray(data[key])) {
+            items = data[key];
+            break;
+          }
+        }
+      }
       if (!items || !Array.isArray(items)) {
         return res.json({ offers: [] });
       }
       const offers = items.map(item => {
-        const totalPrice = item.fromPrice?.value ?? 0;
+        const totalPrice = item?.fromPrice?.value ?? 0;
         return {
-          productId: item.id,
-          name: item.name,
+          productId: item.id || '',
+          name: item.name || '',
           totalPrice,
           currency: 'EUR',
           availability: totalPrice > 0,
