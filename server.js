@@ -116,14 +116,59 @@ app.post('/get-price', async (req, res) => {
       if (!items || !Array.isArray(items)) {
         return res.json({ offers: [] });
       }
+      // Extract product IDs from the services to request detailed pricing
+      const productIds = items.map(item => item.id);
+      // Build payload for pricematrix endpoint
+      const pricePayload = {
+        productIds,
+        fromDate: `${arrival}T00:00:00.000`,
+        nights,
+        units: 1,
+        adults,
+        childrenAges: children.join(',') || '',
+        mealCode: '',
+        currency: 'EUR',
+        nightsRange: 0,
+        arrivalRange: 0
+      };
+      // Construct URL for pricematrix for this accommodation
+      const priceUrl = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}/pricematrix`;
+      let priceData = [];
+      try {
+        const priceResp = await axios.post(priceUrl, pricePayload, { headers });
+        priceData = priceResp.data;
+      } catch (priceErr) {
+        console.error('Feratel API ERROR (pricematrix):', priceErr.response?.data || priceErr.message);
+      }
+      // Build a lookup for total price per productId
+      const priceLookup = {};
+      if (Array.isArray(priceData)) {
+        priceData.forEach(item => {
+          const pid = item.productId;
+          let priceList = [];
+          Object.values(item.data || {}).forEach(dayList => {
+            dayList.forEach(entry => {
+              if (typeof entry.price === 'number' && entry.price >= 0) {
+                priceList.push(entry.price);
+              }
+            });
+          });
+          const total = priceList.reduce((sum, p) => sum + p, 0);
+          priceLookup[pid] = {
+            total,
+            available: priceList.length === nights
+          };
+        });
+      }
       const offers = items.map(item => {
-        const totalPrice = item?.fromPrice?.value ?? 0;
+        const pid = item.id;
+        const priceInfo = priceLookup[pid] || { total: 0, available: false };
         return {
-          productId: item.id || '',
+          productId: pid || '',
           name: item.name || '',
-          totalPrice,
+          totalPrice: priceInfo.total || 0,
           currency: 'EUR',
-          availability: totalPrice > 0,
+          availability: priceInfo.available,
           nights
         };
       });
