@@ -59,54 +59,68 @@ app.post('/get-price', async (req, res) => {
     arrivalRange: 0
   };
 
-  // Construct endpoint URL using destination, language (en), prefix and accommodation ID
-  const apiUrl = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}/pricematrix`;
+    // Prepare common headers for Feratel requests
+    const headers = {
+      'Content-Type': 'application/json',
+      'DW-Source': 'dwapp-accommodation',
+      'DW-SessionId': Date.now().toString(),
+      'Accept': 'application/json, text/plain, */*',
+      'Origin': 'https://direct.bookingandmore.com',
+      'Referer': 'https://direct.bookingandmore.com'
+    };
 
-  try {
-    const response = await axios.post(apiUrl, payload, {
-      headers: {
-        'Content-Type': 'application/json',
-        // Feratel expects a DW-Source header identifying the app making the request.
-        'DW-Source': 'dwapp-accommodation',
-        // Feratel also requires a DW-SessionId header; a timestamp string works as a unique ID.
-        'DW-SessionId': Date.now().toString(),
-        // Optional but recommended headers based on HAR capture
-        'Accept': 'application/json, text/plain, */*',
-        'Origin': 'https://direct.bookingandmore.com',
-        'Referer': 'https://direct.bookingandmore.com'
-      }
-    });
-
-    // Aggregate prices for each product
-    const offers = response.data.map(({ productId, data }) => {
-      const priceList = [];
-      // The API returns an object keyed by the number of units (usually "1").
-      Object.values(data).forEach(dayList => {
-        dayList.forEach(entry => {
-          // Only consider valid prices (price >= 0)
-          if (typeof entry.price === 'number' && entry.price >= 0) {
-            priceList.push(entry.price);
+    try {
+      // Step 1: Create a search to obtain a searchId
+      const searchPayload = {
+        searchObject: {
+          searchGeneral: {
+            dateFrom: `${arrival}T00:00:00.000`,
+            dateTo: `${departure}T00:00:00.000`
+          },
+          searchAccommodation: {
+            searchLines: [
+              {
+                units: 1,
+                adults,
+                children: children.length,
+                childrenAges: children
+              }
+            ]
           }
-        });
-      });
-      const totalPrice = priceList.reduce((sum, p) => sum + p, 0);
-      return {
-        productId,
-        totalPrice,
-        currency: 'EUR',
-        availability: priceList.length === nights,
-        nights
+        }
       };
-    });
-
-    res.json({ offers });
-  } catch (error) {
-    console.error('Feratel API ERROR:', error.response?.data || error.message);
-    res.status(500).json({
-      error: 'Failed to fetch data from Feratel',
-      details: error.response?.data || error.message
-    });
-  }
+      const searchResp = await axios.post('https://webapi.deskline.net/searches', searchPayload, { headers });
+      const searchId = searchResp.data?.id;
+      if (!searchId) {
+        return res.status(500).json({ error: 'Failed to initiate search', details: searchResp.data });
+      }
+      // Step 2: Retrieve service (room) results with price information
+      const fields = 'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
+      const servicesUrl = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}/services/searchresults/${searchId}?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1`;
+      const servicesResp = await axios.get(servicesUrl, { headers });
+      const items = servicesResp.data?.items || servicesResp.data;
+      if (!items || !Array.isArray(items)) {
+        return res.json({ offers: [] });
+      }
+      const offers = items.map(item => {
+        const totalPrice = item.fromPrice?.value ?? 0;
+        return {
+          productId: item.id,
+          name: item.name,
+          totalPrice,
+          currency: 'EUR',
+          availability: totalPrice > 0,
+          nights
+        };
+      });
+      res.json({ offers });
+    } catch (error) {
+      console.error('Feratel API ERROR:', error.response?.data || error.message);
+      res.status(500).json({
+        error: 'Failed to fetch data from Feratel',
+        details: error.response?.data || error.message
+      });
+    }
 });
 
 const PORT = 3000;
