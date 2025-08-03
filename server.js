@@ -1,126 +1,199 @@
 const express = require('express');
 const axios = require('axios');
+const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
 app.use(express.json());
+app.use(cors());
 
-// -----------------------------------------------------------------------------
-// Configuration.  Replace these with your own identifiers or set them via
-// environment variables.
-const ACCOMMODATION_ID = process.env.ACCOMMODATION_ID || '5edbae02-da8e-4489-8349-4bb836450b3e';
-const DESTINATION = process.env.FERATEL_DESTINATION || 'accbludenz';
-const PREFIX = process.env.FERATEL_PREFIX || 'BLU';
+// Konfigurace pro Haus St. Martin
+const accommodationId = process.env.ACCOMMODATION_ID || '2e5f1399-f975-45c4-b384-fca5f5beee5e';
+const destination = process.env.DESTINATION || 'accbludenz';
+const prefix = process.env.PREFIX || 'BLU';
 
-// Helper to generate or retrieve a DW‑SessionId.  Feratel expects this to
-// remain consistent across requests.  Use the environment variable
-// DW_SESSION_ID to supply a stable value captured from your browser.  As a
-// fallback, a timestamp‑based ID is used.
-function getSessionId() {
-  return process.env.DW_SESSION_ID || Date.now().toString();
+const serviceIds = [
+  '495ff768-31df-46d6-86bb-4511f038b2df',
+  '37f364f3-26ed-4a20-b696-72f8ef69c00f',
+  'a375e1af-83bc-4aed-b506-a37d1b31f531',
+  '799a77bc-9fd3-4be5-b715-28f9fd51c864',
+  '2c36e072-ba93-45c0-ae6c-98188964e386',
+  '5bf8f190-b5bd-4941-aa50-71ca6564b045'
+];
+
+function toDate(dateStr) {
+  return new Date(dateStr + 'T00:00:00Z');
 }
 
-// Fetch all rooms (services) from Deskline API.  Returns an array of
-// rooms/services with metadata including names, descriptions, images and
-// pricing information.  See API docs for details.
-async function fetchRooms() {
-  const url = `https://webapi.deskline.net/${DESTINATION}/en/accommodations/${PREFIX}/${ACCOMMODATION_ID}/services?fields=id,name,description,rooms,bedrooms,size,order,images(sizes:[55,56,54],types:[13]){imagesFields...,description},fromPrice{value,calcRule,calcDuration},products{id,name,price{min,max,dailyPrice}}&currency=EUR&pageNo=1`;
-  const resp = await axios.get(url);
-  return resp.data;
-}
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'Feratel Price API is running!',
+    version: '1.0.0',
+    accommodation: 'Haus St. Martin'
+  });
+});
 
-// Retrieve precise prices and availability for the given productIds.  The
-// function accepts the start date, number of nights, adults, children ages and
-// units (number of rooms) and returns the raw response from the pricematrix
-// endpoint.  Pass a custom DW‑Source and DW‑SessionId via environment
-// variables if required by your Feratel installation.
-async function fetchPrices(productIds, fromDate, nights, adults, childrenAges, units) {
-  const pricePayload = {
-    productIds,
-    fromDate: `${fromDate}T00:00:00.000`,
-    nights,
-    units,
-    adults,
-    childrenAges: childrenAges.join(','),
-    mealCode: '',
-    currency: 'EUR',
-    nightsRange: 0,
-    arrivalRange: 0
-  };
+// Test endpoint
+app.get('/test', (req, res) => {
+  res.json({ 
+    message: 'Server is working!',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Main price endpoint
+app.post('/get-price', async (req, res) => {
+  const { arrival, departure, adults = 2, children = [] } = req.body;
+
+  // Validace
+  if (!arrival || !departure) {
+    return res.status(400).json({ 
+      error: 'Missing required parameters',
+      required: ['arrival', 'departure'],
+      example: {
+        arrival: '2024-03-15',
+        departure: '2024-03-18',
+        adults: 2,
+        children: []
+      }
+    });
+  }
+
+  const arrivalDate = toDate(arrival);
+  const departureDate = toDate(departure);
+  const millisecondsPerDay = 24 * 60 * 60 * 1000;
+  const nights = Math.round((departureDate - arrivalDate) / millisecondsPerDay);
+  
+  if (nights <= 0) {
+    return res.status(400).json({ error: 'Departure date must be after arrival date' });
+  }
+
   const headers = {
     'Content-Type': 'application/json',
-    'DW-Source': process.env.DW_SOURCE || 'dwapp-accommodation',
-    'DW-SessionId': getSessionId(),
+    'DW-Source': 'dwapp-accommodation',
+    'DW-SessionId': Date.now().toString(),
     'Accept': 'application/json, text/plain, */*',
     'Origin': 'https://direct.bookingandmore.com',
-    'Referer': 'https://direct.bookingandmore.com'
+    'Referer': 'https://direct.bookingandmore.com',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
   };
-  const url = `https://webapi.deskline.net/${DESTINATION}/en/accommodations/${PREFIX}/${ACCOMMODATION_ID}/pricematrix`;
-  const resp = await axios.post(url, pricePayload, { headers });
-  return resp.data;
-}
 
-// Main endpoint.  Accepts arrival, departure, adults, children, units and
-// returns offers with total price, availability, and additional metadata.
-app.post('/get-price', async (req, res) => {
   try {
-    const { arrival, departure, adults = 2, children = [], units = 1 } = req.body;
-    if (!arrival || !departure) {
-      return res.status(400).json({ error: 'Missing arrival/departure' });
-    }
-    const arrivalDate = new Date(arrival);
-    const departureDate = new Date(departure);
-    const nights = Math.round((departureDate - arrivalDate) / (1000 * 60 * 60 * 24));
-    if (nights <= 0) {
-      return res.status(400).json({ error: 'Departure must be after arrival' });
-    }
-    if (!Number.isInteger(units) || units <= 0) {
-      return res.status(400).json({ error: 'Units must be a positive integer' });
-    }
+    console.log(`Processing request: ${arrival} to ${departure}, ${adults} adults, ${children.length} children`);
 
-    // 1. Fetch all rooms/services
-    const services = await fetchRooms();
-    const rooms = (services?.services || services) ?? [];
-    const productIds = rooms.map(room => room.id);
-
-    // 2. Get price matrix for the rooms
-    const priceMatrix = await fetchPrices(productIds, arrival, nights, adults, children, units);
-
-    // 3. Join room metadata with pricing information
-    const result = rooms.map(room => {
-      // Find price data for this room
-      let priceData;
-      if (Array.isArray(priceMatrix)) {
-          priceData = priceMatrix.find(p => p.productId === room.id);
+    // Vytvoření vyhledávání
+    const searchPayload = {
+      searchObject: {
+        searchGeneral: {
+          dateFrom: `${arrival}T00:00:00.000`,
+          dateTo: `${departure}T00:00:00.000`
+        },
+        searchAccommodation: {
+          searchLines: [{
+            units: 1,
+            adults,
+            children: children.length,
+            childrenAges: children
+          }]
+        }
       }
-      // Sum prices for each day in the matrix
-      let totalPrice = 0;
-      if (priceData?.data) {
-        Object.values(priceData.data).forEach(dayArr => {
-          dayArr.forEach(day => {
-            if (typeof day.price === 'number') totalPrice += day.price;
-          });
-        });
+    };
+
+    const searchResp = await axios.post('https://webapi.deskline.net/searches', searchPayload, { headers });
+    const searchId = searchResp.data?.id;
+    
+    if (!searchId) {
+      console.error('Failed to get search ID:', searchResp.data);
+      return res.status(500).json({ error: 'Failed to initiate search' });
+    }
+
+    console.log(`Search ID obtained: ${searchId}`);
+
+    // Získání služeb s cenami
+    const fields = 'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
+    const servicesUrl = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}/services/searchresults/${searchId}?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1`;
+    
+    const servicesResp = await axios.get(servicesUrl, { headers });
+
+    let items;
+    const data = servicesResp.data;
+    if (Array.isArray(data)) {
+      items = data;
+    } else if (data && typeof data === 'object') {
+      for (const key of Object.keys(data)) {
+        if (Array.isArray(data[key])) {
+          items = data[key];
+          break;
+        }
       }
-      return {
-        id: room.id,
-        name: room.name,
-        description: room.description,
-        images: room.images,
-        size: room.size,
-        maxPersons: room.maxPersons,
-        minPersons: room.minPersons,
-        totalPrice,
-        currency: 'EUR',
-        availability: !!(priceData && totalPrice > 0),
-        nights
-      };
+    }
+
+    if (!items || !Array.isArray(items)) {
+      console.log('No items found in response');
+      return res.json({ 
+        offers: [],
+        message: 'No rooms available for selected dates'
+      });
+    }
+
+    console.log(`Found ${items.length} rooms`);
+
+    const offers = items.map(item => ({
+      productId: item.id || '',
+      name: item.name || 'Unknown Room',
+      totalPrice: item?.fromPrice?.value ?? 0,
+      currency: 'EUR',
+      availability: (item?.fromPrice?.value ?? 0) > 0,
+      nights,
+      pricePerNight: item?.fromPrice?.value ? Math.round((item.fromPrice.value / nights) * 100) / 100 : 0
+    }));
+
+    const availableOffers = offers.filter(offer => offer.availability);
+    
+    res.json({ 
+      offers: availableOffers,
+      totalRooms: items.length,
+      availableRooms: availableOffers.length,
+      searchParams: {
+        arrival,
+        departure,
+        nights,
+        adults,
+        children
+      }
     });
-    res.json({ offers: result });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Internal error', details: err.message });
+
+  } catch (error) {
+    console.error('Feratel API ERROR:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Failed to fetch data from Feratel',
+      details: error.response?.data || error.message,
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({
+    error: 'Internal server error',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Endpoint not found',
+    availableEndpoints: ['GET /', 'GET /test', 'POST /get-price']
+  });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('API running on port', PORT));
+app.listen(PORT, () => {
+  console.log(`🚀 Feratel Price API running on port ${PORT}`);
+  console.log(`📍 Accommodation: ${accommodationId}`);
+  console.log(`🏨 Destination: ${destination}`);
+});
