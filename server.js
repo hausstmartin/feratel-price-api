@@ -1,16 +1,22 @@
+// server.js
 const express = require('express');
 const axios = require('axios');
 
 const app = express();
 app.use(express.json());
 
-// === KONFIGURACE ===
-const DW_SOURCE = 'dwapp-accommodation'; // můžeš přepsat dle HAR
-const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
-const destination = 'accbludenz';
-const prefix = 'BLU';
+// ====== KONFIGURACE ======
+const ACCOMMODATION_ID = process.env.FERATEL_ACCOMMODATION_ID || '2e5f1399-f975-45c4-b384-fca5f5beee5e';
+const DESTINATION      = process.env.FERATEL_DESTINATION      || 'accbludenz';
+const PREFIX           = process.env.FERATEL_PREFIX           || 'BLU';
 
-const fallbackServiceIds = [
+// DW-Source – ověřená hodnota z produkčního widgetu
+const DW_SOURCE =
+  process.env.DW_SOURCE ||
+  'dwapp-accommodation'; // <- tohle fungovalo v tvých logách
+
+// Fallback serviceIds, kdyby /services nic nevrátilo (Feratel občas vrátí prázdno bez chyby)
+const FALLBACK_SERVICE_IDS = [
   '495ff768-31df-46d6-86bb-4511f038b2df',
   '37f364f3-26ed-4a20-b696-72f8ef69c00f',
   'a375e1af-83bc-4aed-b506-a37d1b31f531',
@@ -19,42 +25,121 @@ const fallbackServiceIds = [
   '5bf8f190-b5bd-4941-aa50-71ca6564b045'
 ];
 
-function toDate(dateStr) {
-  return new Date(dateStr + 'T00:00:00Z');
-}
+// Pomocné
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const toDate = (s) => new Date(`${s}T00:00:00Z`);
+const isPosInt = (x) => Number.isInteger(x) && x >= 0;
 
-async function feratelCall(method, url, data, dwSource) {
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/plain, */*',
-    'DW-Source': dwSource || DW_SOURCE,
-    'DW-SessionId': Date.now().toString(),
-    'Origin': 'https://direct.bookingandmore.com',
-    'Referer': 'https://direct.bookingandmore.com'
+// ====== Normalizace vstupu ======
+/**
+ * Vrátí:
+ *  - searchLines: [{ units, adults, children, childrenAges }]
+ *  - childrenAgesFlat: všechny dětské věky z celého požadavku v jednom poli (pro pricematrix → CSV)
+ *  - unitsTotal: součet units přes všechny lines (pro kontrolu/debug)
+ */
+function normalizeOccupancy(body) {
+  // 1) Pokročilý tvar – array „occupancies“
+  if (Array.isArray(body.occupancies) && body.occupancies.length > 0) {
+    const lines = [];
+    let agesFlat = [];
+    let unitsTotal = 0;
+
+    for (const occ of body.occupancies) {
+      const units = Number(occ.units ?? 1);
+      const adultsPerUnit = Number(occ.adultsPerUnit ?? occ.adults ?? 2);
+
+      // childrenAgesPerUnit může být:
+      //  - jednorozměrné pole (pro 1 dítě v každé jednotce stejného věku)
+      //  - pole polí (pro různé věky v jedné jednotce)
+      let childrenAgesPerUnit = occ.childrenAgesPerUnit;
+      if (!Array.isArray(childrenAgesPerUnit)) {
+        // fallback: zkus childrenAges nebo prázdné
+        childrenAgesPerUnit = occ.childrenAges || [];
+      }
+      // Znormalizovat na 2D pole: [ [4,8], [5], ... ] pro „units“ kusů
+      if (childrenAgesPerUnit.length > 0 && !Array.isArray(childrenAgesPerUnit[0])) {
+        // je to jednorozměrné → použij stejně pro každou jednotku
+        childrenAgesPerUnit = Array.from({ length: units }, () => childrenAgesPerUnit);
+      }
+
+      for (let i = 0; i < units; i++) {
+        const ages = (childrenAgesPerUnit[i] || []).map(Number).filter((n) => isPosInt(n) && n <= 17);
+        lines.push({
+          units: 1,
+          adults: adultsPerUnit,
+          children: ages.length,
+          childrenAges: ages
+        });
+        agesFlat = agesFlat.concat(ages);
+      }
+      unitsTotal += units;
+    }
+    return { searchLines: lines, childrenAgesFlat: agesFlat, unitsTotal };
+  }
+
+  // 2) Jednoduchý tvar – „units“, „adults“, „childrenAges“
+  const units = Number(body.units ?? 1);
+  const adults = Number(body.adults ?? 2);
+  const ages = (Array.isArray(body.childrenAges) ? body.childrenAges : body.children || [])
+    .map(Number)
+    .filter((n) => isPosInt(n) && n <= 17);
+
+  const line = {
+    units: isPosInt(units) && units > 0 ? units : 1,
+    adults: isPosInt(adults) ? adults : 2,
+    children: ages.length,
+    childrenAges: ages
   };
-  return axios({ method, url, data, headers });
+  return { searchLines: [line], childrenAgesFlat: ages, unitsTotal: line.units };
 }
 
+/** Bezpečné pole → CSV string (pro /pricematrix) */
+function toCsv(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return '';
+  return arr.join(',');
+}
+
+/** Vybalí první pole z „podivného“ JSONu (Feratel to občas balí do objektu s náhodným klíčem) */
+function firstArrayIn(obj) {
+  if (Array.isArray(obj)) return obj;
+  if (obj && typeof obj === 'object') {
+    for (const k of Object.keys(obj)) {
+      if (Array.isArray(obj[k])) return obj[k];
+    }
+  }
+  return [];
+}
+
+// ====== HEADERS ======
+function feratelHeaders(sessionId = Date.now().toString()) {
+  return {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/plain, */*',
+    'DW-Source': DW_SOURCE,          // <- klíčová hlavička
+    'DW-SessionId': sessionId,
+    Origin: 'https://direct.bookingandmore.com',
+    Referer: 'https://direct.bookingandmore.com'
+  };
+}
+
+// ====== ENDPOINT ======
 app.post('/get-price', async (req, res) => {
-  const { arrival, departure, adults = 2, children = [], units = 1 } = req.body;
-
-  if (!arrival || !departure) {
-    return res.status(400).json({ error: 'Missing arrival or departure date' });
-  }
-
-  const nights = Math.round(
-    (toDate(departure) - toDate(arrival)) / (24 * 60 * 60 * 1000)
-  );
-  if (nights <= 0) {
-    return res.status(400).json({ error: 'Departure date must be after arrival date' });
-  }
-
-  const parsedChildren = Array.isArray(children)
-    ? children.map(a => parseInt(a, 10)).filter(a => !isNaN(a) && a >= 0)
-    : [];
-
   try {
-    // 1) search
+    const { arrival, departure } = req.body || {};
+    if (!arrival || !departure) {
+      return res.status(400).json({ error: 'Missing arrival or departure date' });
+    }
+
+    const nights = Math.round((toDate(departure) - toDate(arrival)) / MS_PER_DAY);
+    if (!Number.isFinite(nights) || nights <= 0) {
+      return res.status(400).json({ error: 'Departure date must be after arrival date' });
+    }
+
+    // Normalizace obsazenosti
+    const { searchLines, childrenAgesFlat } = normalizeOccupancy(req.body);
+
+    // 1) /searches → searchId (SEZNAM LINEK)
+    const headers = feratelHeaders();
     const searchPayload = {
       searchObject: {
         searchGeneral: {
@@ -62,62 +147,44 @@ app.post('/get-price', async (req, res) => {
           dateTo: `${departure}T00:00:00.000`
         },
         searchAccommodation: {
-          searchLines: [
-            {
-              units,
-              adults,
-              children: parsedChildren.length,
-              childrenAges: parsedChildren
-            }
-          ]
+          searchLines: searchLines.map((l) => ({
+            units: l.units,                        // POZOR: u searches jsou units v každé lince
+            adults: l.adults,
+            children: l.children,
+            childrenAges: l.childrenAges           // <- pole čísel (tady to Feratel chce jako Array)
+          }))
         }
       }
     };
 
-    const searchResp = await feratelCall(
-      'post',
-      'https://webapi.deskline.net/searches',
-      searchPayload,
-      DW_SOURCE
-    );
-    const searchId = searchResp.data?.id;
+    const searchResp = await axios.post('https://webapi.deskline.net/searches', searchPayload, { headers });
+    const searchId = searchResp?.data?.id;
     if (!searchId) {
-      return res.status(500).json({ error: 'Failed to initiate search', details: searchResp.data });
+      return res.status(502).json({ error: 'Failed to initiate search', details: searchResp?.data || null });
     }
 
-    // 2) services
-    const fields =
-      'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
+    // 2) /services?fields=…&searchId=…
+    const fields = 'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
     const servicesUrl =
-      `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}` +
+      `https://webapi.deskline.net/${DESTINATION}/en/accommodations/${PREFIX}/${ACCOMMODATION_ID}` +
       `/services?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1&searchId=${encodeURIComponent(searchId)}`;
 
-    const servicesResp = await feratelCall('get', servicesUrl, null, DW_SOURCE);
-    let items = [];
-    if (Array.isArray(servicesResp.data)) {
-      items = servicesResp.data;
-    } else if (servicesResp.data && typeof servicesResp.data === 'object') {
-      for (const k of Object.keys(servicesResp.data)) {
-        if (Array.isArray(servicesResp.data[k])) {
-          items = servicesResp.data[k];
-          break;
-        }
-      }
-    }
+    const servicesResp = await axios.get(servicesUrl, { headers });
+    const services = firstArrayIn(servicesResp.data);
 
-    let productIds = items.map(i => i.id).filter(Boolean);
-    if (productIds.length === 0) {
-      productIds = fallbackServiceIds;
-    }
+    // Jestli nic – použij fallback IDs
+    let productIds = services.map((s) => s.id).filter(Boolean);
+    if (productIds.length === 0) productIds = [...FALLBACK_SERVICE_IDS];
 
-    // 3) price matrix
+    // 3) /pricematrix
+    // !!! childrenAges musí být STRING CSV (ne pole) – jinak chyby s EndArray
     const pricePayload = {
       productIds,
       fromDate: `${arrival}T00:00:00.000`,
       nights,
-      units,
-      adults,
-      childrenAges: parsedChildren,
+      units: searchLines.reduce((sum, l) => sum + (Number(l.units) || 0), 0) || 1, // celkový součet units
+      adults: searchLines.reduce((sum, l) => sum + (Number(l.adults) || 0) * (Number(l.units) || 1), 0), // jen pro debug/telemetrii na straně Feratel
+      childrenAges: toCsv(childrenAgesFlat), // <--- KLÍČOVÁ ÚPRAVA
       mealCode: null,
       currency: 'EUR',
       nightsRange: 0,
@@ -125,46 +192,44 @@ app.post('/get-price', async (req, res) => {
     };
 
     const priceUrl =
-      `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}/pricematrix`;
+      `https://webapi.deskline.net/${DESTINATION}/en/accommodations/${PREFIX}/${ACCOMMODATION_ID}/pricematrix`;
 
-    const priceResp = await feratelCall('post', priceUrl, pricePayload, DW_SOURCE);
+    const priceResp = await axios.post(priceUrl, pricePayload, { headers });
+    const matrix = Array.isArray(priceResp.data) ? priceResp.data : [];
 
-    // === DEBUG LOG celá price matrix odpověď ===
-    console.log('=== RAW PRICE MATRIX RESPONSE ===');
-    console.log(JSON.stringify(priceResp.data, null, 2));
+    // 4) Vytvořit lookup productId → součet ceny (vč. additional services)
+    const priceByProduct = {};
+    for (const row of matrix) {
+      const pid = row.productId;
+      let total = 0;
+      let countedNights = 0;
 
-    const priceLookup = {};
-    if (Array.isArray(priceResp.data)) {
-      for (const row of priceResp.data) {
-        const pid = row.productId;
-        let total = 0;
-        let nightsCounted = 0;
-
-        Object.values(row.data || {}).forEach(dayList => {
-          (dayList || []).forEach(entry => {
-            if (typeof entry?.price === 'number') {
-              total += entry.price;
-              nightsCounted += 1;
+      const daysObj = row.data || {};
+      for (const dayKey of Object.keys(daysObj)) {
+        const dayList = Array.isArray(daysObj[dayKey]) ? daysObj[dayKey] : [];
+        for (const entry of dayList) {
+          if (typeof entry?.price === 'number') {
+            total += entry.price;
+            countedNights += 1;
+          }
+          if (Array.isArray(entry?.additionalServices)) {
+            for (const svc of entry.additionalServices) {
+              if (typeof svc?.price === 'number') total += svc.price;
             }
-            if (Array.isArray(entry?.additionalServices)) {
-              entry.additionalServices.forEach(s => {
-                if (typeof s?.price === 'number') total += s.price;
-              });
-            }
-          });
-        });
-
-        priceLookup[pid] = {
-          total,
-          available: nightsCounted >= nights && total > 0
-        };
+          }
+        }
       }
+
+      priceByProduct[pid] = {
+        total,
+        available: countedNights >= nights && total > 0
+      };
     }
 
-    // 4) výsledky
-    const offers = productIds.map(pid => {
-      const meta = (items.find(i => i.id === pid) || {});
-      const price = priceLookup[pid] || { total: 0, available: false };
+    // 5) Výstup
+    const offers = productIds.map((pid) => {
+      const meta = services.find((s) => s.id === pid) || {};
+      const price = priceByProduct[pid] || { total: 0, available: false };
       return {
         productId: pid,
         name: meta.name || '',
@@ -178,22 +243,23 @@ app.post('/get-price', async (req, res) => {
     return res.json({
       offers,
       debug: {
-        usedDW: DW_SOURCE,
-        rawPriceData: priceResp.data
+        dwSource: DW_SOURCE,
+        gotServices: services.length,
+        gotMatrix: matrix.length
       }
     });
   } catch (err) {
-    console.error('Feratel API ERROR:', err.response?.data || err.message);
-    return res.status(500).json({
-      error: 'Failed to fetch data from Feratel',
-      details: err.response?.data || err.message
-    });
+    // Přehledná chyba
+    const details = err?.response?.data || err?.message || 'Unknown error';
+    console.error('Feratel API ERROR:', details);
+    return res.status(500).json({ error: 'Failed to fetch data from Feratel', details });
   }
 });
 
+// ====== START ======
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Feratel Price API running on port ${PORT}`);
-  console.log(`📍 Accommodation: ${accommodationId}`);
-  console.log(`🏨 Destination: ${destination}`);
+  console.log(`📍 Accommodation: ${ACCOMMODATION_ID}`);
+  console.log(`🏨 Destination: ${DESTINATION}`);
 });
