@@ -1,15 +1,12 @@
-// server.js
 const express = require('express');
-const axios   = require('axios');
+const axios = require('axios');
 
 const app = express();
 app.use(express.json());
 
-// ------------ KONFIG ------------
 const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
-const destination     = 'accbludenz';
-const prefix          = 'BLU';
-const FERATEL_BASE    = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}`;
+const destination = 'accbludenz';
+const prefix = 'BLU';
 
 const FALLBACK_SERVICE_IDS = [
   '495ff768-31df-46d6-86bb-4511f038b2df',
@@ -20,47 +17,31 @@ const FALLBACK_SERVICE_IDS = [
   '5bf8f190-b5bd-4941-aa50-71ca6564b045'
 ];
 
-// Feratel chce přesnou hodnotu, tohle je ta, co používá Deskline front-end.
-function feratelHeaders() {
-  return {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/plain, */*',
-    'DW-Source': 'dwapp-accommodation',
-    'DW-SessionId': Date.now().toString(),
-    'Origin':  'https://direct.bookingandmore.com',
-    'Referer': 'https://direct.bookingandmore.com'
-  };
+const FERATEL_BASE = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}`;
+const HEADERS_BASE = {
+  'Content-Type': 'application/json',
+  'Accept': 'application/json, text/plain, */*',
+  'DW-Source': 'dwapp-accommodation',
+  'DW-SessionId': Date.now().toString(),
+  'Origin': 'https://direct.bookingandmore.com',
+  'Referer': 'https://direct.bookingandmore.com'
+};
+
+// --- Helpers ---
+function toDate(dateStr) {
+  return new Date(dateStr + 'T00:00:00Z');
 }
-
-// Axios instance s timeoutem a bez zbytečných rejectů na 4xx
-const http = axios.create({
-  timeout: 15000,
-  validateStatus: () => true
-});
-
-// ------------ HELPERS ------------
-const toDate = (d) => new Date(`${d}T00:00:00Z`);
-
-function clampInt(n, min, max) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return min;
-  return Math.min(max, Math.max(min, Math.floor(x)));
+function numberOrZero(v) {
+  return typeof v === 'number' && isFinite(v) ? v : 0;
 }
-
-// Z pole čísel udělá CSV, pro /pricematrix
-function agesToCsv(arr) {
-  if (!Array.isArray(arr) || !arr.length) return '';
-  return arr.join(',');
-}
-
-// sečtení ceny pro položku dne
-function numberOrZero(v){ return (typeof v === 'number' && isFinite(v)) ? v : 0; }
 function sumEntryPrice(e) {
   return numberOrZero(e?.price) ||
          numberOrZero(e?.value) ||
          numberOrZero(e?.amount) ||
          numberOrZero(e?.dayPrice) ||
-         numberOrZero(e?.total);
+         numberOrZero(e?.total) ||
+         numberOrZero(e?.fromPrice?.value) ||
+         numberOrZero(e?.sumPrice);
 }
 function sumAdditional(entry) {
   let extra = 0;
@@ -69,275 +50,192 @@ function sumAdditional(entry) {
   }
   return extra;
 }
-
-// vybere „první pole“ z často měněné struktury odpovědi
-function firstArrayInObject(obj){
-  if (!obj || typeof obj !== 'object') return [];
-  for (const k of Object.keys(obj)) if (Array.isArray(obj[k])) return obj[k];
-  return [];
-}
-function pluckArrayCandidates(data){
+function pluckArrayCandidates(data) {
   if (Array.isArray(data)) return data;
   if (!data || typeof data !== 'object') return [];
-  const candidates = [
-    data.items, data.results, data.services, data.data, firstArrayInObject(data)
-  ].filter(Array.isArray);
-  return candidates[0] || [];
-}
-
-// Normalizace vstupu – podporuje:
-// 1) jednoduchý tvar: {units, adults, children, childrenAges}
-// 2) více obsazeností: {lines:[{units, adults, childrenAges:[...]}, ...]}
-function normalizeInput(body) {
-  const out = {
-    arrival: body?.arrival,
-    departure: body?.departure,
-    lines: []
-  };
-
-  // varianta 2 – pole obsazeností
-  if (Array.isArray(body?.lines) && body.lines.length) {
-    for (const raw of body.lines) {
-      const units = clampInt(raw?.units ?? 1, 1, 20);
-      const adults = clampInt(raw?.adults ?? 2, 0, 10);
-      // pro jistotu vždy pole věků (čísla >=0)
-      let ages = Array.isArray(raw?.childrenAges) ? raw.childrenAges : [];
-      ages = ages.map(a => clampInt(a, 0, 17)).filter(a => a >= 0);
-      out.lines.push({ units, adults, childrenAges: ages });
-    }
-  } else {
-    // varianta 1 – jednoduché paramy
-    const units = clampInt(body?.units ?? 1, 1, 20);
-    const adults = clampInt(body?.adults ?? 2, 0, 10);
-    const childrenCount = clampInt(body?.children ?? 0, 0, 10);
-    let ages = Array.isArray(body?.childrenAges) ? body.childrenAges : [];
-
-    // pokud přišel jen počet dětí, doplníme defaultní věk 8
-    if ((!ages || !ages.length) && childrenCount > 0) {
-      ages = Array.from({ length: childrenCount }, () => 8);
-    }
-    ages = ages.map(a => clampInt(a, 0, 17)).filter(a => a >= 0);
-
-    out.lines.push({ units, adults, childrenAges: ages });
+  for (const k of Object.keys(data)) {
+    if (Array.isArray(data[k])) return data[k];
   }
-
-  // sloučíme všechny linie do jedné sumy pro /pricematrix,
-  // protože pricematrix API bere adults/units jako sumu, a childrenAges jako CSV
-  const totals = out.lines.reduce((acc, l) => {
-    acc.units  += l.units;
-    acc.adults += l.adults * l.units; // adults jsou „na jednotku“
-    for (let i = 0; i < l.units; i++) acc.childrenAges.push(...l.childrenAges);
-    return acc;
-  }, { units: 0, adults: 0, childrenAges: [] });
-
-  return { ...out, totals };
+  return [];
 }
 
-// ------------ FERATEL VOLÁNÍ ------------
-async function createSearch({ arrival, departure, lines }) {
-  const headers = feratelHeaders();
-
-  // Feratel /searches chce jednotlivé řádky jako searchLines (units/adults/children/childrenAges)
-  const searchLines = lines.map(l => ({
-    units: l.units,
-    adults: l.adults,
-    children: l.childrenAges.length,
-    childrenAges: l.childrenAges
-  }));
-
+// --- API calls ---
+async function createSearch({ arrival, departure, units, adults, childrenAges }) {
   const payload = {
     searchObject: {
       searchGeneral: {
         dateFrom: `${arrival}T00:00:00.000`,
-        dateTo:   `${departure}T00:00:00.000`
+        dateTo: `${departure}T00:00:00.000`
       },
-      searchAccommodation: { searchLines }
+      searchAccommodation: {
+        searchLines: [
+          { units, adults, children: childrenAges.length, childrenAges }
+        ]
+      }
     }
   };
-
-  const resp = await http.post('https://webapi.deskline.net/searches', payload, { headers });
-  if (resp.status >= 200 && resp.status < 300) {
-    return { id: resp.data?.id || null, raw: resp.data };
-  }
-  const err = new Error('Search failed');
-  err.response = resp.data;
-  throw err;
+  const resp = await axios.post('https://webapi.deskline.net/searches', payload, { headers: HEADERS_BASE });
+  return resp.data?.id || null;
 }
 
 async function fetchServices(searchId) {
-  const headers = feratelHeaders();
   const fields = 'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
-  const tried = [];
-
   const urls = [
     `${FERATEL_BASE}/services?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1&pageSize=100&searchId=${encodeURIComponent(searchId)}`,
     `${FERATEL_BASE}/services/searchresults/${encodeURIComponent(searchId)}?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1&pageSize=100`,
     `${FERATEL_BASE}/services?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1&pageSize=100`
   ];
 
+  const debugTried = [];
   for (const url of urls) {
-    const resp = await http.get(url, { headers });
-    tried.push({ url, status: resp.status });
-    if (resp.status >= 200 && resp.status < 300) {
+    try {
+      const resp = await axios.get(url, { headers: HEADERS_BASE, validateStatus: () => true });
+      debugTried.push({ url, status: resp.status });
       const items = pluckArrayCandidates(resp.data);
       if (Array.isArray(items) && items.length) {
-        return { items, tried, used: url };
+        return { items, tried: debugTried, urlUsed: url };
       }
-    }
+    } catch (_) {}
   }
-
-  // fallback: packages -> products
-  const pkgFields = 'id,name,products{id,name}';
-  const pkgUrl = `${FERATEL_BASE}/packages?fields=${encodeURIComponent(pkgFields)}&currency=EUR&pageNo=1&pageSize=100&searchId=${encodeURIComponent(searchId)}`;
-  const pResp = await http.get(pkgUrl, { headers });
-  tried.push({ url: pkgUrl, status: pResp.status });
-
-  if (pResp.status >= 200 && pResp.status < 300) {
-    const arr = pluckArrayCandidates(pResp.data);
-    const items = [];
-    for (const p of arr) {
-      if (Array.isArray(p?.products)) {
-        for (const pr of p.products) items.push({ id: pr.id, name: pr.name });
-      }
-    }
-    if (items.length) return { items, tried, used: pkgUrl };
-  }
-
-  return { items: [], tried, used: null };
+  return { items: [], tried: debugTried, urlUsed: null };
 }
 
-async function fetchPriceMatrix({ arrival, nights, totals, productIds }) {
-  const headers = feratelHeaders();
-  // /pricematrix chce childrenAges jako CSV string, nikoliv pole
+async function fetchProductNames(productIds) {
+  try {
+    const url = `${FERATEL_BASE}/products?fields=id,name&currency=EUR&pageNo=1&pageSize=200`;
+    const resp = await axios.get(url, { headers: HEADERS_BASE });
+    const arr = pluckArrayCandidates(resp.data);
+    const map = new Map();
+    for (const p of arr) {
+      if (p?.id && p?.name) {
+        map.set(p.id, p.name);
+      }
+    }
+    return map;
+  } catch (_) {
+    return new Map();
+  }
+}
+
+async function fetchPriceMatrix({ arrival, nights, units, adults, childrenAges, productIds }) {
   const payload = {
     productIds,
     fromDate: `${arrival}T00:00:00.000`,
     nights,
-    units: totals.units,
-    adults: totals.adults,
-    childrenAges: agesToCsv(totals.childrenAges),
+    units,
+    adults,
+    childrenAges,
     mealCode: null,
     currency: 'EUR',
     nightsRange: 0,
     arrivalRange: 0
   };
-
   const url = `${FERATEL_BASE}/pricematrix`;
-  const resp = await http.post(url, payload, { headers });
-  if (resp.status >= 200 && resp.status < 300) {
-    return { data: resp.data, payload, url };
-  }
-  const err = new Error('Price matrix failed');
-  err.response = resp.data;
-  throw err;
+  const resp = await axios.post(url, payload, { headers: HEADERS_BASE });
+  return { data: resp.data, url, payload };
 }
 
-// ------------ ENDPOINT ------------
-app.get('/healthz', (_, res) => res.json({ ok: true }));
-app.get('/', (_, res) => res.json({ ok: true, service: 'feratel-price-api' }));
-
+// --- Main endpoint ---
 app.post('/get-price', async (req, res) => {
+  const { arrival, departure, adults = 2, children = [], units = 1 } = req.body || {};
+  if (!arrival || !departure) {
+    return res.status(400).json({ error: 'Missing arrival or departure date' });
+  }
+  const nights = Math.round((toDate(departure) - toDate(arrival)) / (24 * 60 * 60 * 1000));
+  if (nights <= 0) return res.status(400).json({ error: 'Departure date must be after arrival date' });
+
+  const childrenAges = (Array.isArray(children) ? children : [])
+    .map(n => Number(n))
+    .filter(n => Number.isFinite(n) && n >= 0);
+
+  const debug = {
+    dwSource: HEADERS_BASE['DW-Source'],
+    input: { arrival, departure, lines: [{ units, adults, childrenAges }], totals: { units, adults, childrenAges }, nights }
+  };
+
   try {
-    const norm = normalizeInput(req.body || {});
-    const { arrival, departure, lines, totals } = norm;
+    // 1. Search
+    const searchId = await createSearch({ arrival, departure, units, adults, childrenAges });
+    debug.searchId = searchId;
+    if (!searchId) return res.status(502).json({ error: 'Failed to initiate search' });
 
-    if (!arrival || !departure) {
-      return res.status(400).json({ error: 'Missing arrival or departure date' });
-    }
+    // 2. Services
+    let { items, tried, urlUsed } = await fetchServices(searchId);
+    debug.servicesTried = tried;
+    debug.servicesUsed = urlUsed;
+    debug.servicesCount = items.length;
 
-    const nights = Math.round((toDate(departure) - toDate(arrival)) / (24 * 60 * 60 * 1000));
-    if (nights <= 0) {
-      return res.status(400).json({ error: 'Departure date must be after arrival date' });
-    }
+    let productIds = items.map(x => x?.id).filter(Boolean);
+    let nameById = new Map(items.map(x => [x?.id, x?.name || '']));
 
-    const debug = {
-      dwSource: 'dwapp-accommodation',
-      input: { arrival, departure, lines, totals, nights }
-    };
-
-    // 1) vytvořit search
-    const search = await createSearch({ arrival, departure, lines });
-    debug.searchId = search.id;
-
-    // 2) načíst services
-    const svc = await fetchServices(search.id);
-    debug.servicesTried = svc.tried;
-    debug.servicesUsed  = svc.used;
-    debug.servicesCount = svc.items.length;
-
-    let productIds = svc.items.map(i => i?.id).filter(Boolean);
-    const nameById = new Map(svc.items.map(i => [i?.id, i?.name || '']));
-
+    // Fallback names
     if (!productIds.length) {
-      // poslední fallback
       productIds = FALLBACK_SERVICE_IDS.slice();
       debug.usedFallbackIds = true;
+      nameById = await fetchProductNames(productIds);
     }
 
-    // 3) ceníky
-    const pm = await fetchPriceMatrix({ arrival, nights, totals, productIds });
-    debug.priceUrl = pm.url;
-    debug.sentToPriceMatrix = {
-      ...pm.payload,
-      productIdsCount: pm.payload.productIds.length
-    };
+    debug.productNamesMap = Object.fromEntries(nameById);
 
-    const rows = Array.isArray(pm.data) ? pm.data : [];
-    debug.gotMatrixRows = rows.length;
+    // 3. Price matrix
+    const { data: pmData, url: priceUrl, payload } =
+      await fetchPriceMatrix({ arrival, nights, units, adults, childrenAges, productIds });
+    debug.priceUrl = priceUrl;
+    debug.sentToPriceMatrix = { ...payload, productIdsCount: payload.productIds.length };
+    debug.pmDataKeys = pmData && typeof pmData === 'object' ? Object.keys(pmData) : typeof pmData;
 
-    // 4) výpočet
+    // 4. Parse prices
     const priceLookup = {};
-    for (const row of rows) {
-      const pid = row?.productId;
-      if (!pid) continue;
+    let matrixRows = Array.isArray(pmData) ? pmData : (Array.isArray(pmData?.rows) ? pmData.rows : []);
+    debug.gotMatrixRows = matrixRows.length;
 
+    for (const row of matrixRows) {
+      const pid = row?.productId || row?.id;
+      if (!pid) continue;
       let total = 0;
       let nightsCounted = 0;
+      const foundPriceFields = new Set();
 
       const daysObj = row?.data && typeof row.data === 'object' ? row.data : {};
       for (const k of Object.keys(daysObj)) {
         const dayList = Array.isArray(daysObj[k]) ? daysObj[k] : [];
         for (const e of dayList) {
-          const base  = sumEntryPrice(e);
+          const base = sumEntryPrice(e);
+          if (base) foundPriceFields.add(Object.keys(e).join(','));
           const extra = sumAdditional(e);
           if (base > 0 || extra > 0) {
-            total += base + extra;
+            total += (base + extra);
             nightsCounted += (base > 0 ? 1 : 0);
           }
         }
       }
-
-      priceLookup[pid] = { total, nightsCounted };
+      priceLookup[pid] = { total, nightsCounted, foundPriceFields: Array.from(foundPriceFields) };
     }
 
-    // 5) odpověď
+    // 5. Output
     const offers = productIds.map(pid => {
-      const price = priceLookup[pid] || { total: 0, nightsCounted: 0 };
+      const metaName = nameById.get(pid) || '';
+      const rec = priceLookup[pid] || { total: 0, nightsCounted: 0, foundPriceFields: [] };
+      const available = rec.total > 0 && rec.nightsCounted >= nights;
       return {
         productId: pid,
-        name: nameById.get(pid) || '',
-        totalPrice: price.total,
+        name: metaName,
+        totalPrice: rec.total,
         currency: 'EUR',
-        availability: price.total > 0 && price.nightsCounted >= nights,
-        nights
+        availability: available,
+        nights,
+        debugPriceFields: rec.foundPriceFields
       };
     });
 
     return res.json({ offers, debug });
   } catch (err) {
-    // Pro Render logy – ať vidíš co přesně Feratel vrátil.
-    console.error('Feratel API ERROR:', err?.response || err?.message || err);
-    return res.status(500).json({
-      error: 'Failed to fetch data from Feratel',
-      details: err?.response || err?.message || 'Unknown error'
-    });
+    console.error('Feratel API ERROR:', err.response?.data || err.message);
+    return res.status(500).json({ error: 'Failed to fetch data from Feratel', details: err.response?.data || err.message });
   }
 });
 
-// ------------ START ------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Feratel Price API running on port ${PORT}`);
-  console.log(`📍 Accommodation: ${accommodationId}`);
-  console.log(`🏨 Destination: ${destination}`);
 });
