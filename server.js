@@ -1,7 +1,7 @@
 // server.js
 const express = require('express');
 const axios = require('axios');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto'); // <— vestavěné, žádný balík navíc
 
 const app = express();
 app.use(express.json());
@@ -68,7 +68,7 @@ function makeHeaders(sessionId) {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/plain, */*',
     'DW-Source': 'dwapp-accommodation',
-    'DW-SessionId': sessionId,                  // <<< kritické
+    'DW-SessionId': sessionId,                  // <<< kritické: stejné pro /searches i /pricematrix
     'Origin':  'https://direct.bookingandmore.com',
     'Referer': 'https://direct.bookingandmore.com'
   };
@@ -80,7 +80,7 @@ async function createSearch({ arrival, departure, lines, headers }) {
     units: l.units,
     adults: l.adults,
     children: (Array.isArray(l.childrenAges) ? l.childrenAges.length : 0),
-    childrenAges: serializeChildrenAges(l.childrenAges) // UI používá string
+    childrenAges: serializeChildrenAges(l.childrenAges) // UI posílá string
   }));
 
   const payload = {
@@ -177,7 +177,7 @@ async function fetchPriceMatrix({ arrival, nights, totalUnits, totalAdults, allC
     nights,
     units: totalUnits,
     adults: totalAdults,
-    childrenAges: serializeChildrenAges(allChildrenAges), // UI: "" nebo "8,12"
+    childrenAges: serializeChildrenAges(allChildrenAges), // "" nebo "8,12"
     mealCode: "",
     currency: 'EUR',
     nightsRange: 1,
@@ -206,7 +206,7 @@ app.post('/get-price', async (req, res) => {
   if (nights <= 0) return res.status(400).json({ error: 'Departure date must be after arrival date' });
 
   // --- jedna session pro celý flow ---
-  const sessionId = uuidv4();
+  const sessionId = randomUUID();
   const headers = makeHeaders(sessionId);
 
   const childrenAges = (Array.isArray(children) ? children : [])
