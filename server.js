@@ -5,13 +5,14 @@ const app = express();
 app.use(express.json());
 
 // === KONFIGURACE ===
-// Správnou hodnotu DW-Source zjistíš z oficiálního volání API (Network tab -> /searches)
-const DW_SOURCE = 'haus-bludenz'; // <-- ZMĚŇ podle projektu
+// Správná hodnota DW-Source z HARu
+const DW_SOURCE = 'dwapp-accommodation';
 
 const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
 const destination     = 'accbludenz';
 const prefix          = 'BLU';
 
+// Fallback service IDs, pokud API nevrátí seznam
 const fallbackServiceIds = [
   '495ff768-31df-46d6-86bb-4511f038b2df',
   '37f364f3-26ed-4a20-b696-72f8ef69c00f',
@@ -39,7 +40,7 @@ app.post('/get-price', async (req, res) => {
     return res.status(400).json({ error: 'Departure date must be after arrival date' });
   }
 
-  // Zajistí, že childrenAges je pole čísel
+  // childrenAges musí být čisté pole čísel
   const parsedChildren = (Array.isArray(children) ? children : [])
     .map(age => Number(age))
     .filter(n => !isNaN(n) && n >= 0);
@@ -54,7 +55,7 @@ app.post('/get-price', async (req, res) => {
   };
 
   try {
-    // 1) vytvořit search a získat searchId
+    // 1) vytvoření search
     const searchPayload = {
       searchObject: {
         searchGeneral: {
@@ -84,7 +85,7 @@ app.post('/get-price', async (req, res) => {
       return res.status(500).json({ error: 'Failed to initiate search', details: searchResp.data });
     }
 
-    // 2) načíst služby (pokoje)
+    // 2) načtení služeb
     const fields =
       'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
     const servicesUrl =
@@ -110,7 +111,7 @@ app.post('/get-price', async (req, res) => {
       productIds = fallbackServiceIds;
     }
 
-    // 3) zavolat pricematrix
+    // 3) získání cen
     const pricePayload = {
       productIds,
       fromDate: `${arrival}T00:00:00.000`,
@@ -157,7 +158,7 @@ app.post('/get-price', async (req, res) => {
       }
     }
 
-    // 4) vrátit nabídky
+    // 4) návrat dat
     const offers = productIds.map(pid => {
       const meta = (items.find(i => i.id === pid) || {});
       const price = priceLookup[pid] || { total: 0, available: false };
@@ -181,7 +182,7 @@ app.post('/get-price', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 10000; // nastaveno podle logů z Render
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Feratel Price API running on port ${PORT}`);
   console.log(`📍 Accommodation: ${accommodationId}`);
