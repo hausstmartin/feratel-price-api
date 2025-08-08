@@ -5,17 +5,10 @@ const app = express();
 app.use(express.json());
 
 // === KONFIGURACE ===
-const DW_SOURCES = [
-  'dwapp-accommodation',
-  'dwapp',
-  'direct-booking',
-  'haus-bludenz',
-  'accbludenz'
-];
-
+const DW_SOURCE = 'dwapp-accommodation'; // můžeš přepsat dle HAR
 const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
-const destination     = 'accbludenz';
-const prefix          = 'BLU';
+const destination = 'accbludenz';
+const prefix = 'BLU';
 
 const fallbackServiceIds = [
   '495ff768-31df-46d6-86bb-4511f038b2df',
@@ -30,21 +23,16 @@ function toDate(dateStr) {
   return new Date(dateStr + 'T00:00:00Z');
 }
 
-async function feratelCall(method, url, payload, dwSource) {
+async function feratelCall(method, url, data, dwSource) {
   const headers = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/plain, */*',
-    'DW-Source': dwSource,
+    'DW-Source': dwSource || DW_SOURCE,
     'DW-SessionId': Date.now().toString(),
-    'Origin':  'https://direct.bookingandmore.com',
+    'Origin': 'https://direct.bookingandmore.com',
     'Referer': 'https://direct.bookingandmore.com'
   };
-  return axios({
-    method,
-    url: url.startsWith('http') ? url : `https://webapi.deskline.net${url}`,
-    data: payload,
-    headers
-  });
+  return axios({ method, url, data, headers });
 }
 
 app.post('/get-price', async (req, res) => {
@@ -61,67 +49,50 @@ app.post('/get-price', async (req, res) => {
     return res.status(400).json({ error: 'Departure date must be after arrival date' });
   }
 
-  // Čisté childrenAges
-  const parsedChildren = (Array.isArray(children) ? children : [])
-    .map(age => Number(age))
-    .filter(n => !isNaN(n) && n >= 0);
-
-  const searchPayload = {
-    searchObject: {
-      searchGeneral: {
-        dateFrom: `${arrival}T00:00:00.000`,
-        dateTo:   `${departure}T00:00:00.000`
-      },
-      searchAccommodation: {
-        searchLines: [
-          {
-            units,
-            adults
-          }
-        ]
-      }
-    }
-  };
-
-  if (parsedChildren.length > 0) {
-    searchPayload.searchObject.searchAccommodation.searchLines[0].children = parsedChildren.length;
-    searchPayload.searchObject.searchAccommodation.searchLines[0].childrenAges = parsedChildren;
-  }
-
-  let searchId = null;
-  let usedDW = null;
+  const parsedChildren = Array.isArray(children)
+    ? children.map(a => parseInt(a, 10)).filter(a => !isNaN(a) && a >= 0)
+    : [];
 
   try {
-    // 1) Získání searchId s fallbackem DW-Source
-    for (const dw of DW_SOURCES) {
-      try {
-        const resp = await feratelCall('post', '/searches', searchPayload, dw);
-        if (resp.data?.id) {
-          searchId = resp.data.id;
-          usedDW = dw;
-          break;
+    // 1) search
+    const searchPayload = {
+      searchObject: {
+        searchGeneral: {
+          dateFrom: `${arrival}T00:00:00.000`,
+          dateTo: `${departure}T00:00:00.000`
+        },
+        searchAccommodation: {
+          searchLines: [
+            {
+              units,
+              adults,
+              children: parsedChildren.length,
+              childrenAges: parsedChildren
+            }
+          ]
         }
-      } catch (err) {
-        const msg = JSON.stringify(err.response?.data || err.message);
-        if (msg.includes('DW-Source')) {
-          continue; // zkus další
-        }
-        throw err; // jiná chyba – ukonči
       }
-    }
+    };
 
+    const searchResp = await feratelCall(
+      'post',
+      'https://webapi.deskline.net/searches',
+      searchPayload,
+      DW_SOURCE
+    );
+    const searchId = searchResp.data?.id;
     if (!searchId) {
-      return res.status(500).json({ error: 'Failed to initiate search with any DW-Source' });
+      return res.status(500).json({ error: 'Failed to initiate search', details: searchResp.data });
     }
 
-    // 2) Načíst služby (pokoje)
-    const fields = 'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
+    // 2) services
+    const fields =
+      'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
     const servicesUrl =
-      `/${destination}/en/accommodations/${prefix}/${accommodationId}` +
+      `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}` +
       `/services?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1&searchId=${encodeURIComponent(searchId)}`;
 
-    const servicesResp = await feratelCall('get', servicesUrl, null, usedDW);
-
+    const servicesResp = await feratelCall('get', servicesUrl, null, DW_SOURCE);
     let items = [];
     if (Array.isArray(servicesResp.data)) {
       items = servicesResp.data;
@@ -139,26 +110,28 @@ app.post('/get-price', async (req, res) => {
       productIds = fallbackServiceIds;
     }
 
-    // 3) Zavolat pricematrix
+    // 3) price matrix
     const pricePayload = {
       productIds,
       fromDate: `${arrival}T00:00:00.000`,
       nights,
       units,
       adults,
+      childrenAges: parsedChildren,
+      mealCode: null,
       currency: 'EUR',
       nightsRange: 0,
       arrivalRange: 0
     };
 
-    if (parsedChildren.length > 0) {
-      pricePayload.childrenAges = parsedChildren;
-    }
-
     const priceUrl =
-      `/${destination}/en/accommodations/${prefix}/${accommodationId}/pricematrix`;
+      `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}/pricematrix`;
 
-    const priceResp = await feratelCall('post', priceUrl, pricePayload, usedDW);
+    const priceResp = await feratelCall('post', priceUrl, pricePayload, DW_SOURCE);
+
+    // === DEBUG LOG celá price matrix odpověď ===
+    console.log('=== RAW PRICE MATRIX RESPONSE ===');
+    console.log(JSON.stringify(priceResp.data, null, 2));
 
     const priceLookup = {};
     if (Array.isArray(priceResp.data)) {
@@ -188,7 +161,7 @@ app.post('/get-price', async (req, res) => {
       }
     }
 
-    // 4) Vrátit nabídky
+    // 4) výsledky
     const offers = productIds.map(pid => {
       const meta = (items.find(i => i.id === pid) || {});
       const price = priceLookup[pid] || { total: 0, available: false };
@@ -205,10 +178,10 @@ app.post('/get-price', async (req, res) => {
     return res.json({
       offers,
       debug: {
-        usedDW
+        usedDW: DW_SOURCE,
+        rawPriceData: priceResp.data
       }
     });
-
   } catch (err) {
     console.error('Feratel API ERROR:', err.response?.data || err.message);
     return res.status(500).json({
