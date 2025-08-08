@@ -1,146 +1,202 @@
-// server.js
-import express from "express";
-import fetch from "node-fetch";
-import cors from "cors";
+const express = require('express');
+const axios = require('axios');
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
-const BASE_URL = "https://webapi.deskline.net/accbludenz/en/accommodations/BLU";
-const DW_SOURCE = "dwapp-accommodation";
+// ---- Feratel config ----
+const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
+const destination = 'accbludenz';
+const prefix = 'BLU';
 
-/**
- * Helper pro bezpečné fetch s fallbackem
- */
-async function safeFetch(url, options = {}, fallback = null) {
-    try {
-        const res = await fetch(url, options);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const text = await res.text();
-        if (!text || text.trim() === "" || res.status === 204) {
-            if (fallback) return fallback;
-            throw new Error(`Empty response from ${url}`);
-        }
-        return JSON.parse(text);
-    } catch (err) {
-        console.error("Fetch error:", url, err.message);
-        return fallback;
-    }
+// Fallback product IDs pokud /services nic nevrátí
+const FALLBACK_PRODUCT_IDS = [
+  "b4265783-9c09-44e0-9af1-63ad964d64b9",
+  "bda33d85-729b-40ca-ba2b-de4ca5e5841b",
+  "78f0ede7-ce03-4806-8556-0d627bff27de",
+  "bdd9a73d-7429-4610-9347-168b4b2785d8",
+  "980db5a5-ac66-49f3-811f-0da67cc4a972",
+  "0d0ae603-3fd9-4abd-98e8-eea813fd2d89"
+];
+
+const FERATEL_BASE = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}`;
+const HEADERS_BASE = {
+  'Content-Type': 'application/json',
+  'Accept': 'application/json, text/plain, */*',
+  'DW-Source': 'dwapp-accommodation',
+  'DW-SessionId': Date.now().toString(),
+  'Origin': 'https://direct.bookingandmore.com',
+  'Referer': 'https://direct.bookingandmore.com'
+};
+
+// ---- Helpery ----
+function toDate(dateStr) {
+  return new Date(dateStr + 'T00:00:00Z');
 }
 
-app.post("/search", async (req, res) => {
-    const { arrival, departure, lines } = req.body;
+function numberOrZero(v) {
+  return typeof v === 'number' && isFinite(v) ? v : 0;
+}
 
-    // Přepočítáme počty
-    const totals = lines.reduce(
-        (acc, line) => {
-            acc.units += line.units || 0;
-            acc.adults += line.adults || 0;
-            if (Array.isArray(line.childrenAges)) {
-                acc.childrenAges.push(...line.childrenAges);
-            }
-            return acc;
-        },
-        { units: 0, adults: 0, childrenAges: [] }
-    );
+function sumEntryPrice(e) {
+  return numberOrZero(e?.price) ||
+         numberOrZero(e?.value) ||
+         numberOrZero(e?.amount) ||
+         numberOrZero(e?.dayPrice) ||
+         numberOrZero(e?.total);
+}
 
-    const nights =
-        (new Date(departure).getTime() - new Date(arrival).getTime()) /
-        (1000 * 60 * 60 * 24);
-
-    let debug = {
-        dwSource: DW_SOURCE,
-        input: { arrival, departure, lines, totals, nights }
-    };
-
-    try {
-        // 1) SearchId
-        const searchUrl = `${BASE_URL}/services?fields=id,name&currency=EUR&pageNo=1&pageSize=100&arrival=${arrival}&departure=${departure}&adults=${totals.adults}`;
-        const servicesData = await safeFetch(searchUrl, {}, { items: [] });
-        debug.servicesTried = [{ url: searchUrl, status: servicesData?.items?.length ? 200 : 204 }];
-
-        let productIds = [];
-        let productNamesMap = {};
-
-        if (servicesData?.items?.length) {
-            productIds = servicesData.items.map(i => i.id);
-            servicesData.items.forEach(item => {
-                productNamesMap[item.id] = item.name || "";
-            });
-        }
-
-        // Fallback: pokud nejsou IDs, zkusíme načíst z packages
-        if (!productIds.length) {
-            const packagesUrl = `${BASE_URL}/packages?fields=id,name,products{id,name}&currency=EUR&pageNo=1&pageSize=100`;
-            const packagesData = await safeFetch(packagesUrl, {}, { items: [] });
-            debug.servicesTried.push({ url: packagesUrl, status: packagesData?.items?.length ? 200 : 204 });
-
-            packagesData.items?.forEach(pkg => {
-                pkg.products?.forEach(prod => {
-                    if (!productIds.includes(prod.id)) {
-                        productIds.push(prod.id);
-                        productNamesMap[prod.id] = prod.name || "";
-                    }
-                });
-            });
-        }
-
-        debug.servicesUsed = productIds.length ? productIds : null;
-        debug.servicesCount = productIds.length;
-        debug.usedFallbackIds = !servicesData?.items?.length;
-
-        // 2) Price matrix
-        let priceMatrixPayload = {
-            productIds,
-            fromDate: new Date(arrival).toISOString(),
-            nights,
-            units: totals.units,
-            adults: totals.adults,
-            childrenAges: totals.childrenAges.length ? totals.childrenAges : [],
-            mealCode: null,
-            currency: "EUR",
-            nightsRange: 0,
-            arrivalRange: 0
-        };
-
-        debug.priceUrl = `${BASE_URL}/pricematrix`;
-        debug.sentToPriceMatrix = { ...priceMatrixPayload, productIdsCount: productIds.length };
-
-        const priceMatrix = await safeFetch(
-            debug.priceUrl,
-            {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(priceMatrixPayload)
-            },
-            { rows: [] }
-        );
-
-        debug.gotMatrixRows = priceMatrix?.rows?.length || 0;
-
-        // 3) Výsledek
-        const offers = productIds.map(pid => {
-            const row = priceMatrix.rows?.find(r => r.productId === pid);
-            return {
-                productId: pid,
-                name: productNamesMap[pid] || "",
-                totalPrice: row?.totalPrice?.value || 0,
-                currency: row?.totalPrice?.currency || "EUR",
-                availability: !!row,
-                nights
-            };
-        });
-
-        res.json({ offers, debug });
-    } catch (error) {
-        console.error("Main error:", error);
-        res.status(500).json({
-            error: "Failed to fetch data from Feratel",
-            details: error.message
-        });
+function sumAdditional(entry) {
+  let extra = 0;
+  if (Array.isArray(entry?.additionalServices)) {
+    for (const s of entry.additionalServices) {
+      extra += numberOrZero(s?.price);
     }
+  }
+  return extra;
+}
+
+// ---- API volání ----
+async function createSearch({ arrival, departure, units, adults, childrenAges }) {
+  const payload = {
+    searchObject: {
+      searchGeneral: {
+        dateFrom: `${arrival}T00:00:00.000`,
+        dateTo: `${departure}T00:00:00.000`
+      },
+      searchAccommodation: {
+        searchLines: [
+          {
+            units,
+            adults,
+            children: childrenAges.length,
+            childrenAges: childrenAges
+          }
+        ]
+      }
+    }
+  };
+  const resp = await axios.post('https://webapi.deskline.net/searches', payload, { headers: HEADERS_BASE });
+  return resp.data?.id || null;
+}
+
+async function fetchServices(searchId) {
+  const fields = `id,usesAvailability,availablilities,name,description,rooms,bedrooms,size,order,images(sizes:[55,56,54],types:[13]){imagesFields...},layout{layoutFields...},licenseNumber,links{name,url,order,type},documents{name,order,url},stars{level,name,url,image},classification{id,name,order,url,icon,image},criterias{groupId,groupName,items{id,name,value}},minPersons,maxPersons,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice},products{id,isBookable,isOfferable,isBookableOnRequest,searchLine,name,owner,type,subType,description,occupancy{minAdults,maxAdults,minChildren,maxChildren,minBed,maxBed},images(count:10,sizes:[55,56,54]){imagesFields...},links{id,name,url,order,type},documents{id,name,order,url},price{min,max,calcRule,calcDuration,dailyPrice},priceDetails{priceDetailsFields...},possibleMeals{code,price},housePackageMaster{isNotRegulationPackage,validityPeriods{dateFrom,dateTo},contentLong,contentTitle,descriptions(types:[8]){description},images(count:10,sizes:[55,56,54]){imagesFields...}},paymentCancellationPolicy(paymentTypes:[1,0,2]){paymentPolicy{paymentMethods,depositCalculationRule,depositAmount,hasPrePaymentLink,textType,defaultHeaderText,defaultText},cancellationPolicy{hasFreeCancellation,lastFreeDate,lastFreeTime,cancellationTextType,defaultHeaderTextNumber,textLines{defaultTextNumber,cancellationCalculationType,cancellationNights,cancellationPercentage,hasFreeTime,cancellationDate,freeTime}}}},handicapFacilities{groupId,groupName,items{id,name,value,comment,handicapGroupIds}},handicapClassifications{id,name,order,icon,image}`;
+  
+  const url = `${FERATEL_BASE}/services?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1&searchId=${encodeURIComponent(searchId)}`;
+  
+  const resp = await axios.get(url, { headers: HEADERS_BASE, validateStatus: false });
+  const items = Array.isArray(resp.data) ? resp.data : (resp.data?.items || []);
+  return items;
+}
+
+async function fetchPriceMatrix({ arrival, nights, units, adults, childrenAges, productIds }) {
+  const payload = {
+    productIds,
+    fromDate: `${arrival}T00:00:00.000`,
+    nights,
+    units,
+    adults,
+    childrenAges: childrenAges.length ? childrenAges.join(',') : "",
+    mealCode: "",
+    currency: "EUR",
+    nightsRange: 1,
+    arrivalRange: 1
+  };
+  const url = `${FERATEL_BASE}/pricematrix`;
+  const resp = await axios.post(url, payload, { headers: HEADERS_BASE });
+  return { data: resp.data, payload, url };
+}
+
+// ---- Endpoint ----
+app.post('/get-price', async (req, res) => {
+  const { arrival, departure, adults = 2, children = [], units = 1 } = req.body || {};
+
+  if (!arrival || !departure) {
+    return res.status(400).json({ error: 'Missing arrival or departure date' });
+  }
+
+  const nights = Math.round((toDate(departure) - toDate(arrival)) / (24 * 60 * 60 * 1000));
+  if (nights <= 0) {
+    return res.status(400).json({ error: 'Departure date must be after arrival date' });
+  }
+
+  const childrenAges = (Array.isArray(children) ? children : [])
+    .map(n => Number(n))
+    .filter(n => Number.isFinite(n) && n >= 0);
+
+  const debug = {
+    input: { arrival, departure, units, adults, childrenAges, nights }
+  };
+
+  try {
+    const searchId = await createSearch({ arrival, departure, units, adults, childrenAges });
+    debug.searchId = searchId;
+
+    let services = await fetchServices(searchId);
+    let productIds = [];
+
+    if (Array.isArray(services) && services.length) {
+      for (const s of services) {
+        if (Array.isArray(s.products)) {
+          for (const p of s.products) {
+            if (p?.id) productIds.push(p.id);
+          }
+        }
+      }
+    }
+
+    if (!productIds.length) {
+      productIds = FALLBACK_PRODUCT_IDS;
+      debug.usedFallback = true;
+    }
+
+    const { data: pmData, payload: sentPayload, url: priceUrl } = await fetchPriceMatrix({
+      arrival, nights, units, adults, childrenAges, productIds
+    });
+
+    debug.pricePayload = sentPayload;
+    debug.priceUrl = priceUrl;
+
+    let matrixRows = Array.isArray(pmData) ? pmData : [];
+    const priceLookup = {};
+
+    for (const row of matrixRows) {
+      const pid = row?.productId;
+      if (!pid) continue;
+      let total = 0;
+      let nightsCounted = 0;
+      for (const day of Object.values(row.data || {})) {
+        if (Array.isArray(day)) {
+          for (const e of day) {
+            const base = sumEntryPrice(e);
+            const extra = sumAdditional(e);
+            if (base > 0 || extra > 0) {
+              total += base + extra;
+              nightsCounted++;
+            }
+          }
+        }
+      }
+      priceLookup[pid] = { total, nightsCounted };
+    }
+
+    const offers = productIds.map(pid => ({
+      productId: pid,
+      totalPrice: priceLookup[pid]?.total || 0,
+      currency: 'EUR',
+      availability: (priceLookup[pid]?.nightsCounted || 0) >= nights,
+      nights
+    }));
+
+    return res.json({ offers, debug });
+  } catch (err) {
+    console.error('Feratel API ERROR:', err.response?.data || err.message);
+    return res.status(500).json({ error: 'Failed to fetch data from Feratel', details: err.response?.data || err.message });
+  }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`🚀 Feratel Price API running on port ${PORT}`);
+});
