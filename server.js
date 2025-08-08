@@ -4,7 +4,7 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-const accommodationId = '5edbae02-da8e-4489-8349-4bb836450b3e';
+const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
 const destination = 'accbludenz';
 const prefix = 'BLU';
 
