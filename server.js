@@ -4,12 +4,14 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-// Feratel context
+// === KONFIGURACE ===
+// Správnou hodnotu DW-Source zjistíš z oficiálního volání API (Network tab -> /searches)
+const DW_SOURCE = 'haus-bludenz'; // <-- ZMĚŇ podle projektu
+
 const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
 const destination     = 'accbludenz';
 const prefix          = 'BLU';
 
-// Fallback serviceIds (když /services nic nevrátí)
 const fallbackServiceIds = [
   '495ff768-31df-46d6-86bb-4511f038b2df',
   '37f364f3-26ed-4a20-b696-72f8ef69c00f',
@@ -37,18 +39,22 @@ app.post('/get-price', async (req, res) => {
     return res.status(400).json({ error: 'Departure date must be after arrival date' });
   }
 
-  // DŮLEŽITÉ: Deskline akceptuje tuto hodnotu DW-Source
+  // Zajistí, že childrenAges je pole čísel
+  const parsedChildren = (Array.isArray(children) ? children : [])
+    .map(age => Number(age))
+    .filter(n => !isNaN(n) && n >= 0);
+
   const headers = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/plain, */*',
-    'DW-Source': 'dwapp-accommodation',
-    'DW-SessionId': Date.now().toString(), // libovolný neprázdný řetězec / session token
+    'DW-Source': DW_SOURCE,
+    'DW-SessionId': Date.now().toString(),
     'Origin':  'https://direct.bookingandmore.com',
     'Referer': 'https://direct.bookingandmore.com'
   };
 
   try {
-    // 1) vyžádáme searchId
+    // 1) vytvořit search a získat searchId
     const searchPayload = {
       searchObject: {
         searchGeneral: {
@@ -60,8 +66,8 @@ app.post('/get-price', async (req, res) => {
             {
               units,
               adults,
-              children: children.length,
-              childrenAges: children // musí být pole čísel
+              children: parsedChildren.length,
+              childrenAges: parsedChildren
             }
           ]
         }
@@ -73,24 +79,20 @@ app.post('/get-price', async (req, res) => {
       searchPayload,
       { headers }
     );
-
     const searchId = searchResp.data?.id;
     if (!searchId) {
-      return res.status(500).json({
-        error: 'Failed to initiate search',
-        details: searchResp.data
-      });
+      return res.status(500).json({ error: 'Failed to initiate search', details: searchResp.data });
     }
 
-    // 2) načteme služby (pokoje) — správná URL se searchId v query
-    const fields = 'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
+    // 2) načíst služby (pokoje)
+    const fields =
+      'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
     const servicesUrl =
       `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}` +
       `/services?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1&searchId=${encodeURIComponent(searchId)}`;
 
     const servicesResp = await axios.get(servicesUrl, { headers });
 
-    // vytáhnout první pole z odpovědi
     let items = [];
     if (Array.isArray(servicesResp.data)) {
       items = servicesResp.data;
@@ -103,19 +105,19 @@ app.post('/get-price', async (req, res) => {
       }
     }
 
-    let productIds = (items || []).map(i => i?.id).filter(Boolean);
+    let productIds = items.map(i => i.id).filter(Boolean);
     if (productIds.length === 0) {
       productIds = fallbackServiceIds;
     }
 
-    // 3) dotaz na pricematrix
+    // 3) zavolat pricematrix
     const pricePayload = {
       productIds,
       fromDate: `${arrival}T00:00:00.000`,
       nights,
       units,
       adults,
-      childrenAges: children, // pole
+      childrenAges: parsedChildren,
       mealCode: null,
       currency: 'EUR',
       nightsRange: 0,
@@ -127,7 +129,6 @@ app.post('/get-price', async (req, res) => {
 
     const priceResp = await axios.post(priceUrl, pricePayload, { headers });
 
-    // 4) spočítat total (room price + additionalServices)
     const priceLookup = {};
     if (Array.isArray(priceResp.data)) {
       for (const row of priceResp.data) {
@@ -156,9 +157,9 @@ app.post('/get-price', async (req, res) => {
       }
     }
 
-    // 5) sestavit odpověď
+    // 4) vrátit nabídky
     const offers = productIds.map(pid => {
-      const meta = (items || []).find(i => i.id === pid) || {};
+      const meta = (items.find(i => i.id === pid) || {});
       const price = priceLookup[pid] || { total: 0, available: false };
       return {
         productId: pid,
@@ -180,7 +181,7 @@ app.post('/get-price', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000; // nastaveno podle logů z Render
 app.listen(PORT, () => {
   console.log(`🚀 Feratel Price API running on port ${PORT}`);
   console.log(`📍 Accommodation: ${accommodationId}`);
