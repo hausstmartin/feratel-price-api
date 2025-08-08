@@ -9,7 +9,6 @@ const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
 const destination = 'accbludenz';
 const prefix = 'BLU';
 
-// Fallback product IDs pokud /services nic nevrátí
 const FALLBACK_PRODUCT_IDS = [
   "b4265783-9c09-44e0-9af1-63ad964d64b9",
   "bda33d85-729b-40ca-ba2b-de4ca5e5841b",
@@ -29,7 +28,7 @@ const HEADERS_BASE = {
   'Referer': 'https://direct.bookingandmore.com'
 };
 
-// ---- Helpery ----
+// ---- Helpers ----
 function toDate(dateStr) {
   return new Date(dateStr + 'T00:00:00Z');
 }
@@ -56,7 +55,7 @@ function sumAdditional(entry) {
   return extra;
 }
 
-// ---- API volání ----
+// ---- API calls ----
 async function createSearch({ arrival, departure, units, adults, childrenAges }) {
   const payload = {
     searchObject: {
@@ -76,16 +75,18 @@ async function createSearch({ arrival, departure, units, adults, childrenAges })
       }
     }
   };
+  console.log("🔍 Sending to /searches:", JSON.stringify(payload, null, 2));
   const resp = await axios.post('https://webapi.deskline.net/searches', payload, { headers: HEADERS_BASE });
+  console.log("✅ Search ID response:", resp.data);
   return resp.data?.id || null;
 }
 
 async function fetchServices(searchId) {
-  const fields = `id,usesAvailability,availablilities,name,description,rooms,bedrooms,size,order,images(sizes:[55,56,54],types:[13]){imagesFields...},layout{layoutFields...},licenseNumber,links{name,url,order,type},documents{name,order,url},stars{level,name,url,image},classification{id,name,order,url,icon,image},criterias{groupId,groupName,items{id,name,value}},minPersons,maxPersons,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice},products{id,isBookable,isOfferable,isBookableOnRequest,searchLine,name,owner,type,subType,description,occupancy{minAdults,maxAdults,minChildren,maxChildren,minBed,maxBed},images(count:10,sizes:[55,56,54]){imagesFields...},links{id,name,url,order,type},documents{id,name,order,url},price{min,max,calcRule,calcDuration,dailyPrice},priceDetails{priceDetailsFields...},possibleMeals{code,price},housePackageMaster{isNotRegulationPackage,validityPeriods{dateFrom,dateTo},contentLong,contentTitle,descriptions(types:[8]){description},images(count:10,sizes:[55,56,54]){imagesFields...}},paymentCancellationPolicy(paymentTypes:[1,0,2]){paymentPolicy{paymentMethods,depositCalculationRule,depositAmount,hasPrePaymentLink,textType,defaultHeaderText,defaultText},cancellationPolicy{hasFreeCancellation,lastFreeDate,lastFreeTime,cancellationTextType,defaultHeaderTextNumber,textLines{defaultTextNumber,cancellationCalculationType,cancellationNights,cancellationPercentage,hasFreeTime,cancellationDate,freeTime}}}},handicapFacilities{groupId,groupName,items{id,name,value,comment,handicapGroupIds}},handicapClassifications{id,name,order,icon,image}`;
-  
+  const fields = `id,name,products{id,name}`;
   const url = `${FERATEL_BASE}/services?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1&searchId=${encodeURIComponent(searchId)}`;
-  
+  console.log("📡 Fetching services:", url);
   const resp = await axios.get(url, { headers: HEADERS_BASE, validateStatus: false });
+  console.log("✅ Services response:", JSON.stringify(resp.data, null, 2).substring(0, 1000) + "...");
   const items = Array.isArray(resp.data) ? resp.data : (resp.data?.items || []);
   return items;
 }
@@ -104,7 +105,9 @@ async function fetchPriceMatrix({ arrival, nights, units, adults, childrenAges, 
     arrivalRange: 1
   };
   const url = `${FERATEL_BASE}/pricematrix`;
+  console.log("💰 Sending to /pricematrix:", JSON.stringify(payload, null, 2));
   const resp = await axios.post(url, payload, { headers: HEADERS_BASE });
+  console.log("💾 Raw priceMatrix response:", JSON.stringify(resp.data, null, 2).substring(0, 1500) + "...");
   return { data: resp.data, payload, url };
 }
 
@@ -125,9 +128,7 @@ app.post('/get-price', async (req, res) => {
     .map(n => Number(n))
     .filter(n => Number.isFinite(n) && n >= 0);
 
-  const debug = {
-    input: { arrival, departure, units, adults, childrenAges, nights }
-  };
+  const debug = { input: { arrival, departure, units, adults, childrenAges, nights } };
 
   try {
     const searchId = await createSearch({ arrival, departure, units, adults, childrenAges });
@@ -166,11 +167,13 @@ app.post('/get-price', async (req, res) => {
       if (!pid) continue;
       let total = 0;
       let nightsCounted = 0;
-      for (const day of Object.values(row.data || {})) {
-        if (Array.isArray(day)) {
-          for (const e of day) {
+      console.log(`\n📊 Price breakdown for ${pid}:`);
+      for (const [date, dayList] of Object.entries(row.data || {})) {
+        if (Array.isArray(dayList)) {
+          for (const e of dayList) {
             const base = sumEntryPrice(e);
             const extra = sumAdditional(e);
+            console.log(`  ${date}: base=${base}, extra=${extra}`);
             if (base > 0 || extra > 0) {
               total += base + extra;
               nightsCounted++;
@@ -191,7 +194,7 @@ app.post('/get-price', async (req, res) => {
 
     return res.json({ offers, debug });
   } catch (err) {
-    console.error('Feratel API ERROR:', err.response?.data || err.message);
+    console.error('❌ Feratel API ERROR:', err.response?.data || err.message);
     return res.status(500).json({ error: 'Failed to fetch data from Feratel', details: err.response?.data || err.message });
   }
 });
