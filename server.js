@@ -6,8 +6,8 @@ app.use(express.json());
 
 // ---- Feratel config
 const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
-const destination     = 'accbludenz';
-const prefix          = 'BLU';
+const destination = 'accbludenz';
+const prefix = 'BLU';
 
 const FALLBACK_SERVICE_IDS = [
   '495ff768-31df-46d6-86bb-4511f038b2df',
@@ -24,24 +24,26 @@ const HEADERS_BASE = {
   'Accept': 'application/json, text/plain, */*',
   'DW-Source': 'dwapp-accommodation',
   'DW-SessionId': Date.now().toString(),
-  'Origin':  'https://direct.bookingandmore.com',
+  'Origin': 'https://direct.bookingandmore.com',
   'Referer': 'https://direct.bookingandmore.com'
 };
 
-// Helpers
-function toDate(dateStr){ return new Date(dateStr + 'T00:00:00Z'); }
-function numberOrZero(v){ return typeof v === 'number' && isFinite(v) ? v : 0; }
+function toDate(dateStr) {
+  return new Date(dateStr + 'T00:00:00Z');
+}
 
-function firstArrayInObject(obj){
+function firstArrayInObject(obj) {
   if (!obj || typeof obj !== 'object') return [];
   for (const k of Object.keys(obj)) {
     if (Array.isArray(obj[k])) return obj[k];
   }
   return [];
 }
-function pluckArrayCandidates(data){
+
+function pluckArrayCandidates(data) {
   if (Array.isArray(data)) return data;
   if (!data || typeof data !== 'object') return [];
+
   const candidates = [
     data.items,
     data.results,
@@ -49,17 +51,23 @@ function pluckArrayCandidates(data){
     data.data,
     firstArrayInObject(data)
   ].filter(Array.isArray);
+
   return candidates[0] || [];
 }
 
-function sumEntryPrice(e){
+function numberOrZero(v) {
+  return typeof v === 'number' && isFinite(v) ? v : 0;
+}
+
+function sumEntryPrice(e) {
   return numberOrZero(e?.price) ||
          numberOrZero(e?.value) ||
          numberOrZero(e?.amount) ||
          numberOrZero(e?.dayPrice) ||
          numberOrZero(e?.total);
 }
-function sumAdditional(entry){
+
+function sumAdditional(entry) {
   let extra = 0;
   if (Array.isArray(entry?.additionalServices)) {
     for (const s of entry.additionalServices) extra += numberOrZero(s?.price);
@@ -67,14 +75,22 @@ function sumAdditional(entry){
   return extra;
 }
 
-// API calls
-async function createSearch({arrival, departure, units, adults, childrenAges}){
+// Create Feratel search
+async function createSearch({ arrival, departure, units, adults, childrenAges }) {
   const payload = {
     searchObject: {
-      searchGeneral: { dateFrom: `${arrival}T00:00:00.000`, dateTo: `${departure}T00:00:00.000` },
+      searchGeneral: {
+        dateFrom: `${arrival}T00:00:00.000`,
+        dateTo: `${departure}T00:00:00.000`
+      },
       searchAccommodation: {
         searchLines: [
-          { units, adults, children: childrenAges.length, childrenAges }
+          {
+            units,
+            adults,
+            children: childrenAges.length,
+            childrenAges: childrenAges.length ? childrenAges.join(',') : "" // <-- fix here
+          }
         ]
       }
     }
@@ -83,7 +99,7 @@ async function createSearch({arrival, departure, units, adults, childrenAges}){
   return resp.data?.id || null;
 }
 
-async function fetchServices(searchId){
+async function fetchServices(searchId) {
   const fields = 'id,name,fromPrice{value,calcRule,calcDuration,mealCode,isBestPrice,isSpecialPrice}';
   const urls = [
     `${FERATEL_BASE}/services?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1&pageSize=100&searchId=${encodeURIComponent(searchId)}`,
@@ -91,24 +107,24 @@ async function fetchServices(searchId){
     `${FERATEL_BASE}/services?fields=${encodeURIComponent(fields)}&currency=EUR&pageNo=1&pageSize=100`,
   ];
 
-  const tried = [];
-  for (const url of urls){
-    try{
-      const resp = await axios.get(url, { headers: HEADERS_BASE, validateStatus: () => true });
-      tried.push({ url, status: resp.status });
+  const debugTried = [];
+  for (const url of urls) {
+    try {
+      const resp = await axios.get(url, { headers: HEADERS_BASE, validateStatus: false });
+      debugTried.push({ url, status: resp.status });
       const items = pluckArrayCandidates(resp.data);
       if (Array.isArray(items) && items.length) {
-        return { items, tried, usedUrl: url };
+        return { items, urlUsed: url, tried: debugTried };
       }
-    }catch(e){ tried.push({ url, status: e.response?.status || 'ERR' }); }
+    } catch (_) {}
   }
 
-  // packages fallback
-  try{
+  try {
     const pkgFields = 'id,name,products{id,name}';
     const pkgUrl = `${FERATEL_BASE}/packages?fields=${encodeURIComponent(pkgFields)}&currency=EUR&pageNo=1&pageSize=100&searchId=${encodeURIComponent(searchId)}`;
-    const resp = await axios.get(pkgUrl, { headers: HEADERS_BASE, validateStatus: () => true });
-    tried.push({ url: pkgUrl, status: resp.status });
+    debugTried.push({ url: pkgUrl, status: null });
+    const resp = await axios.get(pkgUrl, { headers: HEADERS_BASE, validateStatus: false });
+    debugTried[debugTried.length - 1].status = resp.status;
     const arr = pluckArrayCandidates(resp.data);
     const items = [];
     for (const p of arr) {
@@ -116,32 +132,20 @@ async function fetchServices(searchId){
         for (const pr of p.products) items.push({ id: pr.id, name: pr.name });
       }
     }
-    if (items.length) return { items, tried, usedUrl: pkgUrl };
-  }catch(e){}
+    if (items.length) return { items, urlUsed: pkgUrl, tried: debugTried };
+  } catch (_) {}
 
-  return { items: [], tried, usedUrl: null };
+  return { items: [], urlUsed: null, tried: debugTried };
 }
 
-async function fetchProductNames(productIds){
-  try {
-    const url = `${FERATEL_BASE}/products?ids=${productIds.join(',')}&fields=id,name`;
-    const resp = await axios.get(url, { headers: HEADERS_BASE });
-    const items = pluckArrayCandidates(resp.data);
-    const nameMap = new Map(items.map(x => [x?.id, x?.name || '']));
-    return nameMap;
-  } catch(e) {
-    return new Map();
-  }
-}
-
-async function fetchPriceMatrix({arrival, nights, units, adults, childrenAges, productIds}){
+async function fetchPriceMatrix({ arrival, nights, units, adults, childrenAges, productIds }) {
   const payload = {
     productIds,
     fromDate: `${arrival}T00:00:00.000`,
     nights,
     units,
     adults,
-    childrenAges: Array.isArray(childrenAges) ? childrenAges : [],
+    childrenAges: childrenAges.length ? childrenAges.join(',') : "", // <-- fix here
     mealCode: null,
     currency: 'EUR',
     nightsRange: 0,
@@ -152,14 +156,16 @@ async function fetchPriceMatrix({arrival, nights, units, adults, childrenAges, p
   return { data: resp.data, urlUsed: url, payload };
 }
 
-// Endpoint
 app.post('/get-price', async (req, res) => {
   const { arrival, departure, adults = 2, children = [], units = 1 } = req.body || {};
   if (!arrival || !departure) {
     return res.status(400).json({ error: 'Missing arrival or departure date' });
   }
-  const nights = Math.round((toDate(departure) - toDate(arrival)) / (24*60*60*1000));
-  if (nights <= 0) return res.status(400).json({ error: 'Departure date must be after arrival date' });
+
+  const nights = Math.round((toDate(departure) - toDate(arrival)) / (24 * 60 * 60 * 1000));
+  if (nights <= 0) {
+    return res.status(400).json({ error: 'Departure date must be after arrival date' });
+  }
 
   const childrenAges = (Array.isArray(children) ? children : [])
     .map(n => Number(n))
@@ -168,7 +174,8 @@ app.post('/get-price', async (req, res) => {
   const debug = {
     dwSource: HEADERS_BASE['DW-Source'],
     input: {
-      arrival, departure,
+      arrival,
+      departure,
       lines: [{ units, adults, childrenAges }],
       totals: { units, adults, childrenAges },
       nights
@@ -177,47 +184,41 @@ app.post('/get-price', async (req, res) => {
 
   try {
     const searchId = await createSearch({ arrival, departure, units, adults, childrenAges });
-    if (!searchId) return res.status(502).json({ error: 'Failed to initiate search' });
+    if (!searchId) {
+      return res.status(502).json({ error: 'Failed to initiate search' });
+    }
     debug.searchId = searchId;
 
-    const { items, tried, usedUrl } = await fetchServices(searchId);
+    const { items, urlUsed, tried } = await fetchServices(searchId);
     debug.servicesTried = tried;
-    debug.servicesUsed = usedUrl;
+    debug.servicesUsed = urlUsed;
     debug.servicesCount = items.length;
 
-    let productIds = items.map(x => x?.id).filter(Boolean);
-    let nameById = new Map(items.map(x => [x?.id, x?.name || '']));
+    let productIds = (items || []).map(x => x?.id).filter(Boolean);
+    const nameById = new Map((items || []).map(x => [x?.id, x?.name || '']));
 
     if (!productIds.length) {
       productIds = FALLBACK_SERVICE_IDS.slice();
       debug.usedFallbackIds = true;
-      nameById = await fetchProductNames(productIds);
-    } else {
-      // doplň jména pro případ, že některé chybí
-      const missing = productIds.filter(id => !nameById.get(id));
-      if (missing.length) {
-        const extraNames = await fetchProductNames(missing);
-        for (const [id, name] of extraNames) {
-          if (!nameById.get(id)) nameById.set(id, name);
-        }
-      }
     }
 
     const { data: pmData, urlUsed: priceUrlUsed, payload: sentPayload } =
       await fetchPriceMatrix({ arrival, nights, units, adults, childrenAges, productIds });
-
     debug.priceUrl = priceUrlUsed;
-    debug.sentToPriceMatrix = { ...sentPayload, productIdsCount: sentPayload.productIds.length };
-    debug.gotMatrixRows = Array.isArray(pmData) ? pmData.length : 0;
-    debug.rawMatrixSample = JSON.stringify(pmData)?.slice(0, 500); // prvních 500 znaků
+    debug.sentToPriceMatrix = {
+      ...sentPayload,
+      productIdsCount: sentPayload.productIds.length
+    };
+
+    let matrixRows = Array.isArray(pmData) ? pmData : [];
+    debug.gotMatrixRows = matrixRows.length;
 
     const priceLookup = {};
-    const matrixRows = Array.isArray(pmData) ? pmData : [];
-
     for (const row of matrixRows) {
       const pid = row?.productId;
       if (!pid) continue;
-      let total = 0, nightsCounted = 0;
+      let total = 0;
+      let nightsCounted = 0;
       const daysObj = row?.data && typeof row.data === 'object' ? row.data : {};
       for (const k of Object.keys(daysObj)) {
         const dayList = Array.isArray(daysObj[k]) ? daysObj[k] : [];
@@ -234,13 +235,15 @@ app.post('/get-price', async (req, res) => {
     }
 
     const offers = productIds.map(pid => {
+      const metaName = nameById.get(pid) || '';
       const rec = priceLookup[pid] || { total: 0, nightsCounted: 0 };
+      const available = rec.total > 0 && rec.nightsCounted >= nights;
       return {
         productId: pid,
-        name: nameById.get(pid) || '',
+        name: metaName,
         totalPrice: rec.total,
         currency: 'EUR',
-        availability: rec.total > 0 && rec.nightsCounted >= nights,
+        availability: available,
         nights
       };
     });
