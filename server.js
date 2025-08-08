@@ -1,6 +1,7 @@
 // server.js
 const express = require('express');
 const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(express.json());
@@ -10,7 +11,9 @@ const accommodationId = '2e5f1399-f975-45c4-b384-fca5f5beee5e';
 const destination     = 'accbludenz';
 const prefix          = 'BLU';
 
-// ✔ Ověřená sada productIds z DevTools (fungující v UI)
+const FERATEL_BASE = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}`;
+
+// ✔ Ověřená sada productIds z DevTools (funguje v UI)
 const VERIFIED_PRODUCT_IDS = [
   'b4265783-9c09-44e0-9af1-63ad964d64b9',
   'bda33d85-729b-40ca-ba2b-de4ca5e5841b',
@@ -20,7 +23,7 @@ const VERIFIED_PRODUCT_IDS = [
   '0d0ae603-3fd9-4abd-98e8-eea813fd2d89'
 ];
 
-// Starší „historická“ IDs (když vše ostatní selže)
+// Starší nouzová sada (když vše ostatní selže)
 const LEGACY_FALLBACK_IDS = [
   '495ff768-31df-46d6-86bb-4511f038b2df',
   '37f364f3-26ed-4a20-b696-72f8ef69c00f',
@@ -30,20 +33,7 @@ const LEGACY_FALLBACK_IDS = [
   '5bf8f190-b5bd-4941-aa50-71ca6564b045'
 ];
 
-const FERATEL_BASE = `https://webapi.deskline.net/${destination}/en/accommodations/${prefix}/${accommodationId}`;
-
-function makeHeaders() {
-  return {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/plain, */*',
-    // přesně jako web
-    'DW-Source': 'dwapp-accommodation',
-    'DW-SessionId': Date.now().toString(),
-    'Origin':  'https://direct.bookingandmore.com',
-    'Referer': 'https://direct.bookingandmore.com'
-  };
-}
-
+// ---------- helpers ----------
 const toDate = s => new Date(s + 'T00:00:00Z');
 const numberOrZero = v => (typeof v === 'number' && isFinite(v) ? v : 0);
 
@@ -66,16 +56,31 @@ function serializeChildrenAges(arr) {
   const clean = arr.map(x => Number(x)).filter(n => Number.isFinite(n) && n >= 0);
   return clean.length ? clean.join(',') : '';
 }
+function matrixLooksInvalid(rows) {
+  if (!Array.isArray(rows) || !rows.length) return true;
+  const r0 = rows[0];
+  return !r0?.productId || /^0{8}-0{4}-0{4}-0{4}-0{12}$/.test(r0.productId);
+}
 
-// ---- API helpers ------------------------------------------------------------
+// Jedny společné hlavičky pro *celý* request flow (hlavně DW-SessionId!)
+function makeHeaders(sessionId) {
+  return {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json, text/plain, */*',
+    'DW-Source': 'dwapp-accommodation',
+    'DW-SessionId': sessionId,                  // <<< kritické
+    'Origin':  'https://direct.bookingandmore.com',
+    'Referer': 'https://direct.bookingandmore.com'
+  };
+}
 
-async function createSearch({ arrival, departure, lines }) {
-  const headers = makeHeaders();
+// ---------- Feratel calls ----------
+async function createSearch({ arrival, departure, lines, headers }) {
   const searchLines = lines.map(l => ({
     units: l.units,
     adults: l.adults,
     children: (Array.isArray(l.childrenAges) ? l.childrenAges.length : 0),
-    childrenAges: serializeChildrenAges(l.childrenAges)
+    childrenAges: serializeChildrenAges(l.childrenAges) // UI používá string
   }));
 
   const payload = {
@@ -89,46 +94,36 @@ async function createSearch({ arrival, departure, lines }) {
   };
 
   const resp = await axios.post('https://webapi.deskline.net/searches', payload, { headers });
-  return { searchId: resp.data?.id || null, payload, headersUsed: headers['DW-Source'] };
+  return { searchId: resp.data?.id || null, payload };
 }
 
-// Pokus o získání produktů z detailu ubytování (někdy 400 bez kompletních fragmentů)
-async function fetchProductsViaAccommodation(searchId) {
-  const headers = makeHeaders();
+async function fetchProductsViaAccommodation(searchId, headers) {
   const tried = [];
-
-  // Zkusíme několik variant fields (někdy API vyžaduje i top-level id)
-  const fieldsVariants = [
+  const variants = [
     'id,products{id,name}',
     'products{id,name}'
   ];
 
-  for (const fields of fieldsVariants) {
-    const urlWithSearch = `${FERATEL_BASE}?fields=${encodeURIComponent(fields)}&currency=EUR&searchId=${encodeURIComponent(searchId)}`;
-    const urlPlain      = `${FERATEL_BASE}?fields=${encodeURIComponent(fields)}&currency=EUR`;
-
-    for (const url of [urlWithSearch, urlPlain]) {
+  for (const fields of variants) {
+    const urls = [
+      `${FERATEL_BASE}?fields=${encodeURIComponent(fields)}&currency=EUR&searchId=${encodeURIComponent(searchId)}`,
+      `${FERATEL_BASE}?fields=${encodeURIComponent(fields)}&currency=EUR`
+    ];
+    for (const url of urls) {
       try {
         const resp = await axios.get(url, { headers, validateStatus: () => true });
         tried.push({ url, status: resp.status });
-
         if (resp.status >= 200 && resp.status < 300) {
-          const data = resp.data;
+          const d = resp.data;
           let products = [];
-
-          if (Array.isArray(data)) {
-            for (const acc of data) {
-              if (Array.isArray(acc?.products)) products.push(...acc.products);
-            }
-          } else if (data && typeof data === 'object') {
-            if (Array.isArray(data.products)) products = data.products;
-            if (!products.length && Array.isArray(data?.items)) {
-              for (const it of data.items) {
-                if (Array.isArray(it?.products)) products.push(...it.products);
-              }
+          if (Array.isArray(d)) {
+            for (const acc of d) if (Array.isArray(acc?.products)) products.push(...acc.products);
+          } else if (d && typeof d === 'object') {
+            if (Array.isArray(d.products)) products = d.products;
+            if (!products.length && Array.isArray(d.items)) {
+              for (const it of d.items) if (Array.isArray(it?.products)) products.push(...it.products);
             }
           }
-
           if (products.length) {
             const items = products.filter(p => p?.id).map(p => ({ id: p.id, name: p.name || '' }));
             if (items.length) return { items, urlUsed: url, tried };
@@ -139,16 +134,12 @@ async function fetchProductsViaAccommodation(searchId) {
       }
     }
   }
-
   return { items: [], urlUsed: null, tried };
 }
 
-// (Nouzově) services – často 204
-async function fetchProductsViaServices(searchId) {
-  const headers = makeHeaders();
+async function fetchProductsViaServices(searchId, headers) {
   const tried = [];
   const fields = 'id,name';
-
   const urls = [
     `${FERATEL_BASE}/services?fields=${encodeURIComponent(fields)}&currency=EUR&searchId=${encodeURIComponent(searchId)}`,
     `${FERATEL_BASE}/services/searchresults/${encodeURIComponent(searchId)}?fields=${encodeURIComponent(fields)}&currency=EUR`,
@@ -176,19 +167,17 @@ async function fetchProductsViaServices(searchId) {
       tried.push({ url, error: e.message });
     }
   }
-
   return { items: [], urlUsed: null, tried };
 }
 
-async function fetchPriceMatrix({ arrival, nights, totalUnits, totalAdults, allChildrenAges, productIds }) {
-  const headers = makeHeaders();
+async function fetchPriceMatrix({ arrival, nights, totalUnits, totalAdults, allChildrenAges, productIds, headers }) {
   const payload = {
     productIds,
     fromDate: `${arrival}T00:00:00.000`,
     nights,
     units: totalUnits,
     adults: totalAdults,
-    childrenAges: serializeChildrenAges(allChildrenAges),
+    childrenAges: serializeChildrenAges(allChildrenAges), // UI: "" nebo "8,12"
     mealCode: "",
     currency: 'EUR',
     nightsRange: 1,
@@ -200,31 +189,25 @@ async function fetchPriceMatrix({ arrival, nights, totalUnits, totalAdults, allC
   return { data: resp.data, status: resp.status, url, payload };
 }
 
-// Detekce „neplatných“ productIds podle nulového GUID v matrixu
-function matrixLooksInvalid(rows) {
-  if (!Array.isArray(rows) || !rows.length) return true;
-  const r0 = rows[0];
-  return !r0?.productId || /^0{8}-0{4}-0{4}-0{4}-0{12}$/.test(r0.productId);
-}
-
-// ====== HTTP endpoint ======
+// ---------- HTTP endpoint ----------
 app.post('/get-price', async (req, res) => {
   const {
     arrival, departure,
-    adults = 2, units = 1,
+    adults = 2,
+    units  = 1,
     children = [],
     lines = null,
     productIds: overrideProductIds = null
   } = req.body || {};
 
-  if (!arrival || !departure) {
-    return res.status(400).json({ error: 'Missing arrival or departure date' });
-  }
+  if (!arrival || !departure) return res.status(400).json({ error: 'Missing arrival or departure date' });
 
   const nights = Math.round((toDate(departure) - toDate(arrival)) / (24*60*60*1000));
-  if (nights <= 0) {
-    return res.status(400).json({ error: 'Departure date must be after arrival date' });
-  }
+  if (nights <= 0) return res.status(400).json({ error: 'Departure date must be after arrival date' });
+
+  // --- jedna session pro celý flow ---
+  const sessionId = uuidv4();
+  const headers = makeHeaders(sessionId);
 
   const childrenAges = (Array.isArray(children) ? children : [])
     .map(n => Number(n))
@@ -243,30 +226,29 @@ app.post('/get-price', async (req, res) => {
   const allChildrenAges = effectiveLines.flatMap(l => Array.isArray(l.childrenAges) ? l.childrenAges : []);
 
   const debug = {
+    sessionId,
     input: { arrival, departure, units, adults, childrenAges, nights },
     steps: []
   };
 
   try {
     // 1) search
-    const { searchId, payload: searchPayload, headersUsed } =
-      await createSearch({ arrival, departure, lines: effectiveLines });
+    const { searchId, payload: searchPayload } =
+      await createSearch({ arrival, departure, lines: effectiveLines, headers });
+    debug.steps.push({ step: 'createSearch', headersUsed: headers['DW-Source'], searchPayload });
     debug.searchId = searchId;
-    debug.steps.push({ step: 'createSearch', headersUsed, searchPayload });
 
     if (!searchId) return res.status(502).json({ error: 'Failed to initiate search' });
 
-    // 2) produktová ID — priority: request override → ENV → accommodation → services → VERIFIED → LEGACY
+    // 2) productIds
     let items = [];
-    let productSources = [];
+    const productSources = [];
 
-    // a) override z požadavku (pro přesné A/B srovnání s UI)
     if (Array.isArray(overrideProductIds) && overrideProductIds.length) {
       items = overrideProductIds.map(id => ({ id, name: '' }));
       productSources.push({ label: 'override', count: items.length });
     }
 
-    // b) ENV JSON (PRODUCT_IDS='["id1","id2"]')
     if (!items.length && process.env.PRODUCT_IDS) {
       try {
         const envIds = JSON.parse(process.env.PRODUCT_IDS);
@@ -274,73 +256,67 @@ app.post('/get-price', async (req, res) => {
           items = envIds.map(id => ({ id, name: '' }));
           productSources.push({ label: 'env', count: items.length });
         }
-      } catch (_) { /* ignore */ }
+      } catch (_) {}
     }
 
-    // c) accommodation products
     if (!items.length) {
-      const viaAcc = await fetchProductsViaAccommodation(searchId);
+      const viaAcc = await fetchProductsViaAccommodation(searchId, headers);
       productSources.push({ label: 'accommodation', usedUrl: viaAcc.urlUsed, tried: viaAcc.tried, count: viaAcc.items.length });
       if (viaAcc.items.length) items = viaAcc.items;
     }
 
-    // d) services (často 204)
     if (!items.length) {
-      const viaSrv = await fetchProductsViaServices(searchId);
+      const viaSrv = await fetchProductsViaServices(searchId, headers);
       productSources.push({ label: 'services', usedUrl: viaSrv.urlUsed, tried: viaSrv.tried, count: viaSrv.items.length });
       if (viaSrv.items.length) items = viaSrv.items;
     }
 
-    // e) ověřená sada z DevTools
     if (!items.length) {
       items = VERIFIED_PRODUCT_IDS.map(id => ({ id, name: '' }));
       productSources.push({ label: 'verified-fallback', count: items.length });
     }
 
-    // f) historická nouzová
     if (!items.length) {
       items = LEGACY_FALLBACK_IDS.map(id => ({ id, name: '' }));
       productSources.push({ label: 'legacy-fallback', count: items.length });
     }
 
     debug.productSources = productSources;
+
     const productIds = items.map(i => i.id).filter(Boolean);
     const nameById   = new Map(items.map(i => [i.id, i.name || '']));
 
-    if (!productIds.length) {
-      return res.status(404).json({ error: 'No products found for given search' });
-    }
+    if (!productIds.length) return res.status(404).json({ error: 'No products found for given search' });
 
-    // 3) price matrix – přesně jako UI
+    // 3) price matrix (stejná session!)
     let pm = await fetchPriceMatrix({
       arrival, nights,
       totalUnits, totalAdults,
       allChildrenAges,
-      productIds
+      productIds,
+      headers
     });
+    debug.priceUrl     = pm.url;
+    debug.priceStatus  = pm.status;
+    debug.pricePayload = pm.payload;
 
-    debug.priceUrl    = pm.url;
-    debug.priceStatus = pm.status;
-    debug.pricePayload= pm.payload;
-
-    // pokud to vypadá na neplatná IDs (nulový GUID), zkus ověřenou sadu
+    // Pokud to vypadá jako invalid IDs, zkusíme ještě ověřenou sadu
     if (matrixLooksInvalid(pm.data) && productSources[0]?.label !== 'verified-fallback') {
-      const verified = VERIFIED_PRODUCT_IDS.map(id => ({ id, name: '' }));
-      const vidz = verified.map(v => v.id);
+      const vidz = VERIFIED_PRODUCT_IDS.slice();
       pm = await fetchPriceMatrix({
-        arrival, nights, totalUnits, totalAdults, allChildrenAges, productIds: vidz
+        arrival, nights, totalUnits, totalAdults, allChildrenAges, productIds: vidz, headers
       });
       debug.retriedWithVerified = { status: pm.status, productIdsCount: vidz.length };
-      for (const v of verified) if (!nameById.has(v.id)) nameById.set(v.id, v.name || '');
+      for (const id of vidz) if (!nameById.has(id)) nameById.set(id, '');
     }
 
-    // 4) sumace
     const rows = Array.isArray(pm.data) ? pm.data : [];
-    debug.matrixPreview = Array.isArray(rows) ? rows.slice(0, 2).map(r => ({
+    debug.matrixPreview = rows.slice(0, 2).map(r => ({
       productId: r?.productId,
       hasDataKeys: r && r.data ? Object.keys(r.data).length : 0
-    })) : { type: typeof pm.data };
+    }));
 
+    // 4) výpočet
     const priceLookup = {};
     for (const row of rows) {
       const pid = row?.productId;
@@ -349,34 +325,26 @@ app.post('/get-price', async (req, res) => {
       let total = 0;
       let nightsCounted = 0;
       const daysObj = row?.data && typeof row.data === 'object' ? row.data : {};
-      for (const day of Object.keys(daysObj)) {
-        const entries = Array.isArray(daysObj[day]) ? daysObj[day] : [];
-        for (const e of entries) {
-          const base = sumEntryPrice(e);
+      for (const d of Object.keys(daysObj)) {
+        const list = Array.isArray(daysObj[d]) ? daysObj[d] : [];
+        for (const e of list) {
+          const base  = sumEntryPrice(e);
           const extra = sumAdditional(e);
           if (base > 0 || extra > 0) {
             total += base + extra;
-            nightsCounted += (base > 0 ? 1 : 0);
+            if (base > 0) nightsCounted += 1;
           }
         }
       }
       priceLookup[pid] = { total, nightsCounted };
     }
 
-    const offers = (Array.isArray(pm.payload?.productIds) ? pm.payload.productIds : productIds)
-      .map(pid => {
-        const name = nameById.get(pid) || '';
-        const rec  = priceLookup[pid] || { total: 0, nightsCounted: 0 };
-        const available = rec.total > 0 && rec.nightsCounted >= nights;
-        return {
-          productId: pid,
-          name,
-          totalPrice: rec.total,
-          currency: 'EUR',
-          availability: available,
-          nights
-        };
-      });
+    const offers = (pm.payload?.productIds || productIds).map(pid => {
+      const name = nameById.get(pid) || '';
+      const rec  = priceLookup[pid] || { total: 0, nightsCounted: 0 };
+      const available = rec.total > 0 && rec.nightsCounted >= nights;
+      return { productId: pid, name, totalPrice: rec.total, currency: 'EUR', availability: available, nights };
+    });
 
     return res.json({ offers, debug });
   } catch (err) {
